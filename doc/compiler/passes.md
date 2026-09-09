@@ -547,7 +547,14 @@ region-aware 资源分析的峰值不超过 target 寄存器预算时接受。�
 ### `MaterializeRISCVResources`
 
 用 region-aware SSA live interval和 leaf temporary计算 vector/fragment peak，并把每个 leaf 的
-operand/result resource groups写实。资源超限时，只对同一 block 内可合法保存的普通
+operand/result resource groups写实。首次核算前，可将同 block、single-use 的纯整数计算链
+移到唯一 consumer 前：候选仅含 full RVV `binary/cast/widen/narrow`，最多32个节点，
+输入边界仅接受常量或已物化的 numeric read；不移动读取点，也不穿过 deferred field/address。
+只考虑跨 partial set 的最多256个操作窗口，窗口内不得有 region、write或未知 effect。
+移动必须降低 `Σ register_groups × live_interval_length` 且不增加该 block 的实际 peak；
+否则恢复原位置。估计不替代合法性，候选数、选中数和驻留成本减量由
+`weft-resource-sink` 诊断输出。该改写不复制计算、不改整数结合树、Level或storage归属。
+资源超限时，只对同一 block 内可合法保存的普通
 `ValueType` 插入显式 local slot、`spill` 和各 use-site `reload`；fragment spill、跨 block spill
 和任意 pure-producer rematerialization尚未实现时判当前 module非法。
 pure 或仅有 Read effect 的 producer 均可提供被 spill 的数值 SSA；原 producer 保持在

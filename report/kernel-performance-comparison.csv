@@ -9,10 +9,10 @@ dequantize_row_iq3_s,SG2044,tensor,696.065127,358.175832,1.943362,targeted-rerun
 tq1_0_q8_k,SG2044,decode,8.717413,8.123996,1.073045,targeted-rerun
 iq3_xxs_q8_k,SG2044,decode,3.525003,2.673523,1.318486,targeted-rerun
 mul_mat_tq1_0,SG2044,decode,8.752956,8.015470,1.092008,targeted-rerun
-iq1_s_q8_k,K1/X60,decode,2.848863,2.711676,1.050591,targeted-rerun
-iq1_s_q8_k,SG2044,decode,4.466427,4.861243,0.918783,targeted-rerun
-mul_mat_iq1_s,K1/X60,decode,2.859026,2.663380,1.073458,targeted-rerun
-mul_mat_iq1_s,SG2044,decode,4.469317,4.839919,0.923428,targeted-rerun
+iq1_s_q8_k,K1/X60,decode,2.848646,2.711676,1.050511,targeted-rerun
+iq1_s_q8_k,SG2044,decode,4.806918,4.861243,0.988825,targeted-rerun
+mul_mat_iq1_s,K1/X60,decode,2.867496,2.663380,1.076638,targeted-rerun
+mul_mat_iq1_s,SG2044,decode,4.812562,4.839919,0.994348,targeted-rerun
 q2_k_q8_k,SG2044,decode,9.333548,9.460538,0.986577,targeted-rerun
 iq1_m_q8_k,SG2044,decode,2.912463,2.650472,1.098847,targeted-rerun
 mul_mat_iq1_m,SG2044,decode,2.988397,2.639333,1.132255,targeted-rerun

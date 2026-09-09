@@ -9,7 +9,9 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <memory>
 #include <iterator>
@@ -321,6 +323,112 @@ bool canPreserveProducerResult(mlir::Operation *operation) {
   });
 }
 
+bool isIntegerPointwise(mlir::Operation *operation) {
+  if (!mlir::isa<riscv::BinaryOp, riscv::CastOp, riscv::WidenOp,
+                 riscv::NarrowOp>(operation) ||
+      !mlir::isMemoryEffectFree(operation) || operation->getNumResults() != 1)
+    return false;
+  auto result = mlir::dyn_cast<riscv::ValueType>(operation->getResult(0).getType());
+  return result && result.getLayout().getCarrier() == "rvv" &&
+         result.getLayout().getValidity() == "full" &&
+         mlir::isa<mlir::IntegerType>(result.getElementType()) &&
+         llvm::all_of(operation->getOperands(), [](mlir::Value operand) {
+           return mlir::isa<mlir::IntegerType>(
+               riscv_internal::logicalElement(operand.getType()));
+         });
+}
+
+std::optional<int64_t> residentCost(mlir::Block &block) {
+  int64_t cost = 0;
+  for (const Interval &interval : intervalsFor(block)) {
+    const int64_t length = interval.end - interval.begin;
+    if (length && interval.groups >
+                      (std::numeric_limits<int64_t>::max() - cost) / length)
+      return std::nullopt;
+    cost += interval.groups * length;
+  }
+  return cost;
+}
+
+bool sinkIntegerSlice(mlir::Operation *root, mlir::IRRewriter &rewriter,
+                      int64_t &savedCost) {
+  if (!isIntegerPointwise(root) || !root->getResult(0).hasOneUse())
+    return false;
+  mlir::Operation *consumer = *root->getResult(0).getUsers().begin();
+  mlir::Block *block = root->getBlock();
+  if (consumer->getBlock() != block || root->getNextNode() == consumer ||
+      !root->isBeforeInBlock(consumer))
+    return false;
+  llvm::SmallPtrSet<mlir::Operation *, 32> slice;
+  llvm::SmallVector<mlir::Value> worklist{root->getResult(0)};
+  bool numericRead = false;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    auto *definition = value.getDefiningOp();
+    if (!definition)
+      return false;
+    if (mlir::isa<riscv::ConstantOp, mlir::arith::ConstantOp>(definition))
+      continue;
+    // These are numeric SSA snapshots.  Their read sites stay where they were;
+    // deferred Field/Extract/descriptor expressions are deliberately excluded.
+    if (mlir::isa<riscv::FieldReadOp, riscv::RVVReplicaStorageLoadOp,
+                  riscv::RegisterMaterializeOp>(definition)) {
+      numericRead = true;
+      continue;
+    }
+    if (definition->getBlock() != block || !value.hasOneUse() ||
+        !isIntegerPointwise(definition))
+      return false;
+    if (slice.contains(definition))
+      continue;
+    if (slice.size() == 32)
+      return false;
+    slice.insert(definition);
+    llvm::append_range(worklist, definition->getOperands());
+  }
+  if (!numericRead)
+    return false;
+  llvm::SmallVector<mlir::Operation *> ordered;
+  llvm::SmallVector<mlir::Operation *> oldNext;
+  bool crossedPartial = false;
+  unsigned distance = 0;
+  for (mlir::Operation &operation : *block) {
+    if (&operation == consumer)
+      break;
+    if (slice.contains(&operation)) {
+      ordered.push_back(&operation);
+      oldNext.push_back(operation.getNextNode());
+    }
+    if (ordered.empty())
+      continue;
+    if (++distance > 256 || operation.getNumRegions() ||
+        !canPreserveProducerResult(&operation))
+      return false;
+    crossedPartial |= llvm::any_of(operation.getResultTypes(), [](mlir::Type type) {
+      return mlir::isa<riscv::PartialSetType>(type);
+    });
+  }
+  if (!crossedPartial || ordered.size() != slice.size())
+    return false;
+  auto beforeCost = residentCost(*block);
+  if (!beforeCost)
+    return false;
+  const int64_t beforePeak = analyzeBlock(*block).total();
+  for (auto *operation : ordered)
+    rewriter.moveOpBefore(operation, consumer);
+  auto afterCost = residentCost(*block);
+  if (afterCost && *afterCost < *beforeCost &&
+      savedCost <= std::numeric_limits<int64_t>::max() -
+                       (*beforeCost - *afterCost) &&
+      analyzeBlock(*block).total() <= beforePeak) {
+    savedCost += *beforeCost - *afterCost;
+    return true;
+  }
+  for (auto [operation, next] : llvm::reverse(llvm::zip(ordered, oldNext)))
+    rewriter.moveOpBefore(operation, next);
+  return false;
+}
+
 mlir::LogicalResult rebindFieldReadProjections(
     riscv::KernelOp kernel, mlir::IRRewriter &rewriter) {
   llvm::SmallVector<riscv::FieldReadOp> reads;
@@ -517,6 +625,21 @@ public:
     for (riscv::KernelOp kernel : getOperation().getOps<riscv::KernelOp>()) {
       if (kernel.getResourcesMaterialized())
         continue;
+      llvm::SmallVector<mlir::Operation *> pointwise;
+      kernel.walk([&](mlir::Operation *operation) {
+        if (isIntegerPointwise(operation))
+          pointwise.push_back(operation);
+      });
+      int64_t savedCost = 0;
+      unsigned sunkSlices = 0;
+      for (auto *operation : llvm::reverse(pointwise))
+        if (sinkIntegerSlice(operation, rewriter, savedCost))
+          ++sunkSlices;
+      if (sunkSlices)
+        llvm::errs() << "weft-resource-sink: candidates=" << pointwise.size()
+                     << " selected=" << sunkSlices
+                     << " estimated-register-residence-reduction=" << savedCost
+                     << '\n';
       int64_t spillIdentity = 1;
       kernel.walk([&](riscv::LocalAllocOp allocation) {
         auto type = allocation.getResult().getType();
