@@ -552,33 +552,35 @@ public:
           rewriter.eraseOp(producer);
         changed = true;
       }
-    }
 
-    // Dominating identical conversions share one SSA result.
-    getOperation().walk([&](mlir::Block *block) {
-      llvm::SmallVector<riscv::ConvertLayoutOp> available;
-      for (mlir::Operation &operation : llvm::make_early_inc_range(*block)) {
-        auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
-        if (!conversion || !isPureRepresentationConversion(conversion))
-          continue;
-        auto found = llvm::find_if(available, [&](riscv::ConvertLayoutOp prior) {
-          return prior.getInput() == conversion.getInput() &&
-                 prior.getResult().getType() ==
-                     conversion.getResult().getType() &&
-                 prior->getAttr("conversion") ==
-                     conversion->getAttr("conversion") &&
-                 prior->getAttr("source_access") ==
-                     conversion->getAttr("source_access") &&
-                 prior->getAttr("leaf") == conversion->getAttr("leaf");
-        });
-        if (found == available.end()) {
-          available.push_back(conversion);
-          continue;
+      // Sharing conversions can expose a single-use producer.  Feed that
+      // change back into this same rematerialization fixed point.
+      getOperation().walk([&](mlir::Block *block) {
+        llvm::SmallVector<riscv::ConvertLayoutOp> available;
+        for (mlir::Operation &operation : llvm::make_early_inc_range(*block)) {
+          auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
+          if (!conversion || !isPureRepresentationConversion(conversion))
+            continue;
+          auto found = llvm::find_if(available, [&](riscv::ConvertLayoutOp prior) {
+            return prior.getInput() == conversion.getInput() &&
+                   prior.getResult().getType() ==
+                       conversion.getResult().getType() &&
+                   prior->getAttr("conversion") ==
+                       conversion->getAttr("conversion") &&
+                   prior->getAttr("source_access") ==
+                       conversion->getAttr("source_access") &&
+                   prior->getAttr("leaf") == conversion->getAttr("leaf");
+          });
+          if (found == available.end()) {
+            available.push_back(conversion);
+            continue;
+          }
+          conversion.getResult().replaceAllUsesWith(found->getResult());
+          rewriter.eraseOp(conversion);
+          changed = true;
         }
-        conversion.getResult().replaceAllUsesWith(found->getResult());
-        rewriter.eraseOp(conversion);
-      }
-    });
+      });
+    }
 
   }
 };

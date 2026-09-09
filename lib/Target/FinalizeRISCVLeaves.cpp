@@ -8,6 +8,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <memory>
 #include <string>
@@ -69,6 +70,55 @@ void foldIntegerIdentities(mlir::ModuleOp module) {
     if (operation.getKind() == "add")
       tryIdentity(operation.getRhs(), operation.getLhs());
   });
+}
+
+void foldUnsignedPowerOfTwoArithmetic(mlir::ModuleOp module) {
+  mlir::IRRewriter rewriter(module.getContext());
+  unsigned quotients = 0, remainders = 0;
+  llvm::SmallVector<riscv::BinaryOp> candidates;
+  module.walk([&](riscv::BinaryOp op) { candidates.push_back(op); });
+  for (auto operation : candidates) {
+    auto kernel = operation->getParentOfType<riscv::KernelOp>();
+    auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+    auto element = result
+        ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+        : mlir::IntegerType();
+    if (!kernel || kernel.getResourcesMaterialized() || !element ||
+        !element.isUnsigned() || result.getLayout().getCarrier() != "rvv" ||
+        operation.getLhs().getType() != result ||
+        operation.getRhs().getType() != element ||
+        (operation.getKind() != "div" && operation.getKind() != "mod"))
+      continue;
+    mlir::Attribute attribute;
+    if (auto constant = operation.getRhs().getDefiningOp<riscv::ConstantOp>())
+      attribute = constant.getValue();
+    if (auto constant = operation.getRhs().getDefiningOp<mlir::arith::ConstantOp>())
+      attribute = constant.getValue();
+    auto divisor = mlir::dyn_cast_or_null<mlir::IntegerAttr>(attribute);
+    if (!divisor || !divisor.getValue().isPowerOf2())
+      continue;
+    const bool quotient = operation.getKind() == "div";
+    llvm::APInt immediate = quotient
+        ? llvm::APInt(element.getWidth(), divisor.getValue().logBase2())
+        : divisor.getValue() - 1;
+    rewriter.setInsertionPoint(operation);
+    auto constant = rewriter.create<riscv::ConstantOp>(
+        operation.getLoc(), element, rewriter.getIntegerAttr(element, immediate));
+    llvm::StringRef instruction = quotient ? "rvv.vsrl.vx" : "rvv.vand.vx";
+    auto replacement = rewriter.create<riscv::BinaryOp>(
+        operation.getLoc(), result, operation.getLhs(), constant.getResult(),
+        quotient ? "shr" : "and",
+        riscv_internal::leaf(
+            rewriter, "rvv", "pointwise", instruction, instruction,
+            result.getLayout().getRegisterGroups(),
+            result.getLayout().getRegisterGroups(), 0, 0, "none", "agnostic"));
+    riscv_internal::copyOrigin(operation, replacement);
+    rewriter.replaceOp(operation, replacement.getResult());
+    quotient ? ++quotients : ++remainders;
+  }
+  if (quotients || remainders)
+    llvm::errs() << "weft-constant-div: power-of-two-quotients=" << quotients
+                 << " power-of-two-remainders=" << remainders << '\n';
 }
 
 void selectUnsignedMultiplyHigh(mlir::ModuleOp module) {
@@ -200,6 +250,7 @@ public:
 
   void runOnOperation() override {
     foldIntegerIdentities(getOperation());
+    foldUnsignedPowerOfTwoArithmetic(getOperation());
     selectUnsignedMultiplyHigh(getOperation());
     if (mlir::failed(materializeFieldReads(getOperation()))) {
       signalPassFailure();

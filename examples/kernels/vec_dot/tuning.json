@@ -31,7 +31,7 @@
     "vec-dot:sg2044 iq1_m": {"entry":"iq1_m_q8_k.py","symbol":"quantized_vec_dot_iq1_m_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1},"binding_origin":"targeted-rerun"},
     "vec-dot:sg2044 iq1_s": {"entry":"iq1_s_q8_k.py","symbol":"quantized_vec_dot_iq1_s_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":4,"pipeline_depth":1}},
     "vec-dot:sg2044 iq2_s": {"entry":"iq2_s_q8_k.py","symbol":"quantized_vec_dot_iq2_s_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
-    "vec-dot:sg2044 iq2_xs": {"entry":"iq2_xs_q8_k.py","symbol":"quantized_vec_dot_iq2_xs_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
+    "vec-dot:sg2044 iq2_xs": {"entry":"iq2_xs_q8_k.py","symbol":"quantized_vec_dot_iq2_xs_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":4,"pipeline_depth":1},"binding_origin":"targeted-rerun"},
     "vec-dot:sg2044 iq2_xxs": {"entry":"iq2_xxs_q8_k.py","symbol":"quantized_vec_dot_iq2_xxs_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1},"binding_origin":"measured-physical-subset"},
     "vec-dot:sg2044 iq3_s": {"entry":"iq3_s_q8_k.py","symbol":"quantized_vec_dot_iq3_s_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
     "vec-dot:sg2044 iq3_xxs": {"entry":"iq3_xxs_q8_k.py","symbol":"quantized_vec_dot_iq3_xxs_q8_k","source":{},"physical":{"lmul_eighths":64,"unroll":1,"pipeline_depth":1},"binding_origin":"measured-lmul-subset"},

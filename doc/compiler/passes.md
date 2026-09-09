@@ -236,6 +236,8 @@ reuse 证明，不由该窄合同猜测。
 该 pass 只做已经实现的真实 rewrite：相邻 pure 逆 conversion 消除、单 use 纯 pointwise producer
 的 backward rematerialization，以及同一 block 内相同 conversion 的 SSA CSE。它不声称已经
 实现跨 block hoist/sink、全局 conversion algebra 或任意 producer rematerialization。
+conversion CSE 与 backward rematerialization 处于同一个固定点：合并conversion后新出现的
+single-use producer须在本次pass内继续处理，不留给下一次解析/重放才改变其表示。
 
 partial materialization 后，`physical-share` 的 input/result 都变成单 use 时，若到唯一
 conversion 的同 block 区间没有写入或未知 effect，允许移除这条已无共享用途的边界，
@@ -460,6 +462,8 @@ slot pack统一使用最终VL：每次slide保留已构造前缀，未构造lane
 全部被后续slide覆盖；输入的未定义尾lane不会进入最终数值运算。
 局部选择先检查target、坐标与资源合同，再比较包含pack、seed、reduction和VL设置的成本；
 可scalar-rematerialize的供应以无vector extract的成本下界比较。供应搜索最多32个节点，
+包括静态一维`iota`：同逻辑range/axis的scalar replica使用既有`register.iota`，
+不能因初始vector坐标表示漏掉这条合法供应；查询与物化接受相同的producer集合。
 估计以`weft.riscv.packed_scale_cost = [packed, scalar]`保存在selected op中，不作为合法性证明。
 单scale窗口声明三个temporary vector groups，多窗口拼接声明四个；最终live-set仍由资源pass重算。
 
@@ -487,6 +491,13 @@ physical op集合，不为同一个operation重复选择instruction。
 输入与结果的完整 type（含 axes、validity、layout）必须一致。零值证明最多访问 32 个
 producer，仅穿过整数常量、整数转换、纯布局转换、splat/broadcast 和整数乘零，
 不把浮点恒等式或轴消除混入该规则。失去用途的广播链由后续同一条 CSE/dead-layout 主链清理。
+
+无符号 RVV 整数值除以或模一个直接标量、非零二次幂常量时，分别选择同 type 的
+`shr(log2(divisor))` 或 `and(divisor-1)` 与对应 exact leaf；不改 Canonical IR。
+lhs/result 的完整 type 必须相同，rhs 必须是同元素类型的直接整数常量，因而不存在
+广播/validity 变化或有符号负数舍入歧义。零除数、非二次幂、动态除数及有符号除法不匹配。
+常量计算使用定宽 APInt，不靠宿主有符号移位；`weft-constant-div` 输出实际选中的商/余数数量。
+emitter 沿用已选 shift/and 的拼写，资源由同一后续主链闭合。
 
 已选 unsigned widening vector-scalar multiply 的结果若只被同宽右移消费，右移量是
 输入 SEW 的直接整数常量，且右移也只被非饱和、rtz narrow 消费，narrow 的完整结果 type

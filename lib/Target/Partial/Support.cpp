@@ -2641,9 +2641,9 @@ mlir::FailureOr<mlir::Value> rematerializeScalarReplicas(
     memo.try_emplace(value, scalarLoad.getResult());
     return scalarLoad.getResult();
   }
-  if (!producer || !mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
-                              riscv::CastOp, riscv::NarrowOp,
-                              riscv::WidenOp>(producer) ||
+  if (!producer || !mlir::isa<riscv::IotaOp, riscv::UnaryOp, riscv::BinaryOp,
+                              riscv::CompareOp, riscv::CastOp,
+                              riscv::NarrowOp, riscv::WidenOp>(producer) ||
       producer->getNumResults() != 1)
     return mlir::failure();
   riscv::ValueType targetType = scalarReplicaType(rewriter, sourceType);
@@ -2699,7 +2699,7 @@ bool supportsScalarReplicaRematerialization(
     return gather.getResults().size() == 1 && gather.getIndices().size() == 1 &&
            bases && bases.size() == 1 && bases[0] == 0;
   }
-  if (!mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
+  if (!mlir::isa<riscv::IotaOp, riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
                  riscv::CastOp, riscv::NarrowOp, riscv::WidenOp>(producer) ||
       producer->getNumResults() != 1)
     return false;
