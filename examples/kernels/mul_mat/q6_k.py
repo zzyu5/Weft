@@ -25,11 +25,12 @@ def production_mul_mat_q6_k(
                         w = wp[nb, kb]
                         x = xp[mb, kb]
                         integer_acc = wl.state(wl.i32, [MR, NR], init=wl.i32(0))
-                        with wl.level.subtiles(kb, extent=16) as sub:
-                            q = wl.i8(w.ql[:, sub]) | wl.i8(w.qh[:, sub]) << wl.u8(4)
+                        with wl.level.subtiles(kb, extent=64) as pair:
+                            q = wl.i8(w.ql[:, pair]) | wl.i8(w.qh[:, pair]) << wl.u8(4)
                             q -= wl.i8(32)
-                            integer = wl.dot(x.q[:, sub], q, over="k", acc_dtype=wl.i32)
-                            integer_acc += integer * wl.i32(w.scales[:, sub])
+                            with wl.level.subtiles(pair, extent=16) as sub:
+                                integer = wl.dot(x.q[:, sub], q[:, sub], over="k", acc_dtype=wl.i32)
+                                integer_acc += integer * wl.i32(w.scales[:, sub])
                         acc += (
                             wl.f32(x.ds) * wl.f32(w.d) * wl.widen(integer_acc, wl.f32)
                         )
