@@ -5,6 +5,7 @@
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -755,6 +756,90 @@ public:
     // Defer its deletion until every candidate handle has been inspected.
     for (mlir::Value sign : deadSigns)
       eraseDeadTree(sign, rewriter);
+
+    llvm::SmallVector<riscv::BinaryOp> signValues;
+    getOperation().walk([&](riscv::BinaryOp operation) {
+      if (operation.getKind() == "sub")
+        signValues.push_back(operation);
+    });
+    for (auto subtract : signValues) {
+      auto type = mlir::dyn_cast<riscv::ValueType>(subtract.getResult().getType());
+      auto kernel = subtract->getParentOfType<riscv::KernelOp>();
+      mlir::Value doubled;
+      int64_t zeroBitValue = 0;
+      if (riscv_internal::constantInt(subtract.getRhs()) == 1) {
+        doubled = subtract.getLhs();
+        zeroBitValue = -1;
+      } else if (riscv_internal::constantInt(subtract.getLhs()) == 1) {
+        doubled = subtract.getRhs();
+        zeroBitValue = 1;
+      } else {
+        continue;
+      }
+      if (!type || !kernel || doubled.getType() != type)
+        continue;
+      doubled = stripSingleUsePureCopies(doubled, subtract->getBlock());
+      mlir::Value bit;
+      if (!doubled ||
+          !isBinaryWithConstant(doubled.getDefiningOp<riscv::BinaryOp>(), "mul", 2, bit))
+        continue;
+      bit = stripSingleUsePureCopies(bit, subtract->getBlock());
+      if (!bit || bit.getType() != type)
+        continue;
+      if (auto widen = bit.getDefiningOp<riscv::WidenOp>())
+        bit = widen.getInput();
+      else if (auto cast = bit.getDefiningOp<riscv::CastOp>())
+        bit = cast.getInput();
+      else
+        continue;
+      bit = stripSingleUsePureCopies(bit, subtract->getBlock());
+      auto mask = bit ? bit.getDefiningOp<riscv::RVVBitmaskWindowLoadOp>()
+                      : riscv::RVVBitmaskWindowLoadOp();
+      auto decode = bit ? bit.getDefiningOp<riscv::RVVBitmaskDecodeOp>()
+                        : riscv::RVVBitmaskDecodeOp();
+      auto maskLeaf = mask ? mask.getLeaf() : decode ? decode.getLeaf() : riscv::LeafAttr();
+      if (!maskLeaf ||
+          (mask && maskLeaf.getInstruction() != "rvv.bitmask-window-load") ||
+          (decode && maskLeaf.getInstruction() != "rvv.bitmask-decode") ||
+          !riscv::supportsRVVMaskedNegate(kernel.getTarget(), type,
+                                         mlir::cast<riscv::ValueType>(bit.getType())))
+        continue;
+      const llvm::StringRef maskInstruction =
+          mask ? "rvv.bitmask-window-mask" : "rvv.bitmask-decode-mask";
+      bit.getDefiningOp()->setAttr("leaf", riscv_internal::leaf(
+          rewriter, "rvv", maskLeaf.getFamily(), maskInstruction,
+          maskInstruction, maskLeaf.getOperandGroups(),
+          maskLeaf.getResultGroups(), 0, 0, "none", maskLeaf.getTail(),
+          maskLeaf.getParameters(), 0));
+      rewriter.setInsertionPoint(subtract);
+      auto seed = rewriter.create<riscv::ConstantOp>(
+          subtract.getLoc(), type.getElementType(),
+          rewriter.getIntegerAttr(type.getElementType(), zeroBitValue));
+      auto splat = rewriter.create<riscv::RVVSplatOp>(
+          subtract.getLoc(), type, seed.getResult(),
+          riscv_internal::leaf(rewriter, "rvv", "splat", "rvv.splat", "rvv.splat",
+                               0, type.getLayout().getRegisterGroups(), 0, 0,
+                               "none", "exact"));
+      auto selected = rewriter.create<riscv::RVVMaskedNegateOp>(
+          subtract.getLoc(), type, splat.getResult(), bit,
+          riscv_internal::leaf(rewriter, "rvv", "masked-negate", "rvv.masked-negate",
+                               "rvv.masked-negate", 0, 0,
+                               std::max<int64_t>(1, (type.getLayout().getLmulEighths() + 7) / 8),
+                               0, "none", maskLeaf.getTail()));
+      riscv_internal::copyOrigin(subtract, selected);
+      if (type.getLayout().getRegisterGroups() > 1)
+        if (auto loop = selected->getParentOfType<mlir::scf::ForOp>()) {
+          // One typed mask selection expands across a register cohort. Keep
+          // the physical unroll binding; downstream scalar-loop heuristics
+          // cannot infer that cohort's code size from one intrinsic call.
+          loop->setAttr("weft.riscv.system_unroll",
+                        rewriter.getStringAttr("disable"));
+        }
+      llvm::SmallVector<mlir::Value> oldOperands(subtract->getOperands());
+      rewriter.replaceOp(subtract, selected.getResult());
+      for (mlir::Value operand : oldOperands)
+        eraseDeadTree(operand, rewriter);
+    }
 
     llvm::SmallVector<riscv::BinaryOp> merges;
     getOperation().walk([&](riscv::BinaryOp operation) {

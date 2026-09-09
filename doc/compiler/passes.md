@@ -228,6 +228,13 @@ count、repeat、lane/time/replica mapping与每个physical part的source base�
 scalar-vector leaf。该改写不依赖format名字，也不把任意storage proposal当作contraction
 carrier。无法闭合或不会到达vector boundary时保留原typed gather。
 
+joined field 的最后一个 role header 与 low-bit payload 物理相邻时，完整零基 source
+window 可选择 `rvv.regular-repeat-joined-unit`：一次连续 byte load 后用已物化的 repeat
+indices 做 register gather。group 为不超过128的二次幂，完整两组byte均落在field storage
+内，所有结果同type、full、SEW8且carrier容纳整个窗口。shift后不再需要的mask由planner
+证明并冻结为leaf参数，verifier重算；scratch固定4倍result register groups。该关系不把
+不同逻辑field当成同一field，也不移动读取越过write或unknown effect。
+
 对一个完整 encoded field 同时有外层 RVV consumer 与内层 `group_index` scalar
 consumer 的情形，pass 只在 field owner/name、logical shape/axes、parent/sub-Level point
 几何、分组步长和重复 decode 全部一致时，在两类 use 的共同支配 Level 物化
@@ -322,6 +329,12 @@ contraction 的 unroll 只能属于它真实的多 issue reduction loop。单 is
 同 type、单 use 的 pure copy；不穿过 read conversion，不复制或移动 mask 读取。
 data 上已有的 widening/cast 原位保留，因而不能用窄整数取负替代宽整数取负；也不改变
 scale/reduction 的位置。`1-2*bit` 与 reduction 使用的 `2*bit-1` 分别匹配，不能混用符号方向。
+
+尚未被product/reduction关系消费的两种符号表达，也可直接选择 `splat(±1)` 加既有
+`rvv_masked_negate`，复用 window-load 或 point-anchored bitmask-decode 的 mask-only leaf。
+mask读取点、time/lane/replica、tail、下游原宽乘法均保持；取负对象只有常量±1，不将
+任意i8数据取负后再widen。一个选择展开成多个register replica时，所在物理loop保留
+已选unroll绑定，禁止系统编译器根据缩短的intrinsic表面再次展开该register cohort。
 
 ### `ScheduleRISCVLevels` 与 `PipelineRISCVLevels`
 

@@ -40,6 +40,7 @@ bool supportsRVVPartialPackedScale(TargetAttr target,
 bool supportsRVVMaskedNegate(TargetAttr target, ValueType data, ValueType mask);
 bool supportsRVVWidenAdd(TargetAttr target, ValueType lhs, ValueType rhs,
                          ValueType result);
+bool supportsRVVJoinedUnitGather(RVVRegularRepeatGatherOp operation);
 
 /// Returns the complete physical lane span of one RVV value.
 std::optional<int64_t> rvvLaneCount(ValueType value);

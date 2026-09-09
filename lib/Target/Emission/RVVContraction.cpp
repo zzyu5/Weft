@@ -505,7 +505,8 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
       instruction == "rvv.regular-repeat-joined-gather.pow2";
   const bool joinedGatherDivision =
       instruction == "rvv.regular-repeat-joined-gather.div";
-  const bool joinedGather = joinedGatherPowerOfTwo || joinedGatherDivision;
+  const bool joinedUnit = instruction == "rvv.regular-repeat-joined-unit";
+  const bool joinedGather = joinedGatherPowerOfTwo || joinedGatherDivision || joinedUnit;
   const bool broadcastOnly =
       joinedBroadcast || instruction == "rvv.regular-repeat-broadcast";
   const bool powerOfTwo = instruction == "rvv.regular-repeat-gather.pow2";
@@ -570,6 +571,17 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
     }
     record += ")";
     sourceRecords.push_back(record);
+    if (joinedUnit) {
+      std::string raw = fresh("joined_unit_bytes");
+      line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
+           "((const uint8_t *)(" + record + ") + " +
+           std::to_string(storage->bitOffset / 8 +
+                          operation.getAccess().getJoinRole() *
+                              operation.getAccess().getGroupSize()) +
+           ", " + std::to_string(operation.getSourceCount()) + ");");
+      sourceWindows.push_back(std::move(raw));
+      continue;
+    }
     if (broadcastOnly || joinedGather)
       continue;
     if (operation.getAccess().getMapping() != "natural")
@@ -686,9 +698,9 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
         }
         std::string within = fresh("joined_within");
         line(indexType + " " + within + " = __riscv_" +
-             std::string(joinedGatherPowerOfTwo ? "vand_vx_" : "vremu_vx_") +
+             std::string((joinedGatherPowerOfTwo || joinedUnit) ? "vand_vx_" : "vremu_vx_") +
              indexSuffix + "(" + logicalIndex + ", " +
-             std::to_string(joinedGatherPowerOfTwo ? group - 1 : group) +
+             std::to_string((joinedGatherPowerOfTwo || joinedUnit) ? group - 1 : group) +
              ", " + vl + ");");
         auto addByteOffset = [&](int64_t offset,
                                  llvm::StringRef stem) -> std::string {
@@ -700,34 +712,42 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
                std::to_string(offset) + ", " + vl + ");");
           return value;
         };
-        const std::string roleOffsets =
-            addByteOffset(role * group, "joined_role_offsets");
-        const std::string lowOffsets =
-            addByteOffset(fields * group, "joined_low_offsets");
         const std::string pointer =
             "((const uint8_t *)(" + sourceRecords[replica] + ") + " +
             std::to_string(storage->bitOffset / 8) + ")";
         std::string roleBytes = fresh("joined_role_bytes");
-        line(resultType + " " + roleBytes + " = __riscv_vluxei" +
-             std::to_string(indexLayout.getSew()) + "_v_" + resultSuffix +
-             "(" + pointer + ", " + roleOffsets + ", " + vl + ");");
         std::string lowBytes = fresh("joined_low_bytes");
-        line(resultType + " " + lowBytes + " = __riscv_vluxei" +
-             std::to_string(indexLayout.getSew()) + "_v_" + resultSuffix +
-             "(" + pointer + ", " + lowOffsets + ", " + vl + ");");
+        if (joinedUnit) {
+          const std::string lowOffsets = addByteOffset(group, "joined_low_offsets");
+          line(resultType + " " + roleBytes + " = __riscv_vrgather_vv_" + resultSuffix +
+               "(" + sourceWindows[replica] + ", " + within + ", " + vl + ");");
+          line(resultType + " " + lowBytes + " = __riscv_vrgather_vv_" + resultSuffix +
+               "(" + sourceWindows[replica] + ", " + lowOffsets + ", " + vl + ");");
+        } else {
+          const std::string roleOffsets = addByteOffset(role * group, "joined_role_offsets");
+          const std::string lowOffsets = addByteOffset(fields * group, "joined_low_offsets");
+          line(resultType + " " + roleBytes + " = __riscv_vluxei" +
+               std::to_string(indexLayout.getSew()) + "_v_" + resultSuffix +
+               "(" + pointer + ", " + roleOffsets + ", " + vl + ");");
+          line(resultType + " " + lowBytes + " = __riscv_vluxei" +
+               std::to_string(indexLayout.getSew()) + "_v_" + resultSuffix +
+               "(" + pointer + ", " + lowOffsets + ", " + vl + ");");
+        }
         const std::string head =
             "__riscv_vand_vx_" + resultSuffix + "(" + roleBytes + ", " +
             std::to_string(logicalMask) + ", " + vl + ")";
-        const std::string low =
-            "__riscv_vand_vx_" + resultSuffix + "(__riscv_vsrl_vx_" +
-            resultSuffix + "(" + lowBytes + ", " +
-            std::to_string(physicalRole * lowBits) + ", " + vl + "), " +
-            std::to_string(lowMask) + ", " + vl + ")";
-        const std::string high =
-            "__riscv_vand_vx_" + resultSuffix + "(__riscv_vsrl_vx_" +
-            resultSuffix + "(" + roleBytes + ", " +
-            std::to_string(logicalWidth) + ", " + vl + "), " +
-            std::to_string(highMask) + ", " + vl + ")";
+        const uint64_t selectedLowMask = joinedUnit ? operation.getLeaf().getParameters()[4] : lowMask;
+        const uint64_t selectedHighMask = joinedUnit ? operation.getLeaf().getParameters()[5] : highMask;
+        std::string low = "__riscv_vsrl_vx_" + resultSuffix + "(" + lowBytes + ", " +
+                          std::to_string(physicalRole * lowBits) + ", " + vl + ")";
+        std::string high = "__riscv_vsrl_vx_" + resultSuffix + "(" + roleBytes + ", " +
+                           std::to_string(logicalWidth) + ", " + vl + ")";
+        if (selectedLowMask)
+          low = "__riscv_vand_vx_" + resultSuffix + "(" + low + ", " +
+                std::to_string(selectedLowMask) + ", " + vl + ")";
+        if (selectedHighMask)
+          high = "__riscv_vand_vx_" + resultSuffix + "(" + high + ", " +
+                 std::to_string(selectedHighMask) + ", " + vl + ")";
         const std::string assembled =
             operation.getAccess().getOrder() == "lo_first"
                 ? "__riscv_vor_vv_" + resultSuffix + "(" + low +

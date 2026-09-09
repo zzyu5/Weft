@@ -330,7 +330,9 @@ Emitter::compileRVVBitplaneMerge(riscv::RVVBitplaneMergeOp operation) {
 
 mlir::LogicalResult
 Emitter::compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.bitmask-decode")
+  const bool maskOnly =
+      instructionOf(operation.getOperation()) == "rvv.bitmask-decode-mask";
+  if (!maskOnly && instructionOf(operation.getOperation()) != "rvv.bitmask-decode")
     return fail(operation, "RVV bitmask decode has no exact selected leaf");
   Binding packed = bindings.lookup(operation.getField());
   Binding origin = bindings.lookup(operation.getOrigin());
@@ -373,7 +375,7 @@ Emitter::compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation) {
   const std::string maskType =
       "vbool" + std::to_string(maskBits) + "_t";
   Binding result;
-  result.kind = Binding::Kind::Vector;
+  result.kind = maskOnly ? Binding::Kind::Mask : Binding::Kind::Vector;
   for (int64_t part = 0; part < parts; ++part) {
     auto coordinates =
         registerCoordinates(operation.getResult(), part / streams);
@@ -402,6 +404,10 @@ Emitter::compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation) {
     line(maskType + " " + mask + " = __riscv_vlm_v_b" +
          std::to_string(maskBits) + "((const uint8_t *)(" + record + "), " +
          vl + ");");
+    if (maskOnly) {
+      result.parts.push_back(std::move(mask));
+      continue;
+    }
     std::string decoded = fresh("bitmask_decode");
     line(type + " " + decoded + " = __riscv_vmerge_vxm_" + suffix +
          "(__riscv_vmv_v_x_" + suffix + "(0, " + vl + "), 1, " + mask +

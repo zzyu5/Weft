@@ -3938,6 +3938,25 @@ public:
               {first.sourceAxis, first.reductionAxis, sourceCount,
                first.repeat}));
       riscv_internal::copyOrigin(first.extract, gather);
+      if (riscv::supportsRVVJoinedUnitGather(gather)) {
+        const int64_t width = riscv_internal::logicalBitWidth(first.resultType.getElementType());
+        const auto access = first.field.getAccess();
+        const int64_t low = access.getJoinLowBits();
+        const int64_t role = access.getOrder() == "lo_first"
+                                 ? access.getJoinRole()
+                                 : access.getJoinFields() - 1 - access.getJoinRole();
+        const int64_t lowMask = (role + 1) * low == 8 ? 0 : (int64_t{1} << low) - 1;
+        const int64_t highMask = 2 * width - low == 8 ? 0 : (int64_t{1} << (width - low)) - 1;
+        gather.setLeafAttr(riscv_internal::leaf(
+            rewriter, "rvv", "regular-repeat-gather",
+            "rvv.regular-repeat-joined-unit", "rvv.regular-repeat-joined-unit",
+            mlir::cast<riscv::ValueType>(first.field.getResult().getType())
+                .getLayout().getRegisterGroups(),
+            0, 4 * first.resultType.getLayout().getRegisterGroups(), 0,
+            "none", "exact",
+            {first.sourceAxis, first.reductionAxis, sourceCount, first.repeat,
+             lowMask, highMask}));
+      }
 
       for (auto [index, candidate] : llvm::enumerate(group)) {
         mlir::Value replacement = gather.getResults()[index];

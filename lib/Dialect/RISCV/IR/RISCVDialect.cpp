@@ -5613,8 +5613,10 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
               result.getLayout().getLaneFactors()[axisPosition] !=
           extent ||
       (validity != "full" && validity != "tail") ||
-      !exactLeaf(getLeaf(), "rvv", "bitmask-decode", "rvv.bitmask-decode",
-                 "none", tail))
+      (!exactLeaf(getLeaf(), "rvv", "bitmask-decode", "rvv.bitmask-decode",
+                  "none", tail) &&
+       !exactLeaf(getLeaf(), "rvv", "bitmask-decode", "rvv.bitmask-decode-mask",
+                  "none", tail)))
     return emitOpError(
                "RVV bitmask decode requires a byte-aligned contiguous logical-u1 field, "
                "a record owner covering the sub-Level origin, an explicitly anchored "
@@ -5706,6 +5708,7 @@ bool weft::riscv::supportsRVVMaskedNegate(TargetAttr target, ValueType data,
 mlir::LogicalResult RVVMaskedNegateOp::verify() {
   auto kernel = (*this)->getParentOfType<KernelOp>();
   auto maskLoad = getMask().getDefiningOp<RVVBitmaskWindowLoadOp>();
+  auto maskDecode = getMask().getDefiningOp<RVVBitmaskDecodeOp>();
   auto data = getData().getType();
   llvm::StringRef tail =
       data.getLayout().getValidity() == "tail" ? "agnostic" : "exact";
@@ -5713,9 +5716,11 @@ mlir::LogicalResult RVVMaskedNegateOp::verify() {
       std::max<int64_t>(1, (data.getLayout().getLmulEighths() + 7) / 8);
   if (!kernel ||
       !supportsRVVMaskedNegate(kernel.getTarget(), data, getMask().getType()) ||
-      getResult().getType() != data || !maskLoad ||
-      !exactLeaf(maskLoad.getLeaf(), "rvv", "bitmask-window-load",
-                 "rvv.bitmask-window-mask", "none", tail) ||
+      getResult().getType() != data ||
+      !((maskLoad && exactLeaf(maskLoad.getLeaf(), "rvv", "bitmask-window-load",
+                               "rvv.bitmask-window-mask", "none", tail)) ||
+        (maskDecode && exactLeaf(maskDecode.getLeaf(), "rvv", "bitmask-decode",
+                                 "rvv.bitmask-decode-mask", "none", tail))) ||
       !exactLeaf(getLeaf(), "rvv", "masked-negate", "rvv.masked-negate",
                  "none", tail) ||
       getLeaf().getTemporaryGroups() != temporaryGroups ||
@@ -6816,6 +6821,45 @@ mlir::LogicalResult RVVRegularRepeatIndexOp::verify() {
   return mlir::success();
 }
 
+bool weft::riscv::supportsRVVJoinedUnitGather(
+    RVVRegularRepeatGatherOp operation) {
+  auto access = operation.getAccess();
+  auto base = operation.getSourceBase().getDefiningOp<mlir::arith::ConstantIndexOp>();
+  auto field = operation.getField().getType();
+  auto kernel = operation->getParentOfType<KernelOp>();
+  const int64_t group = access.getGroupSize();
+  const int64_t fields = access.getJoinFields();
+  auto element = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  const int64_t width = element ? element.getWidth() : 0;
+  const int64_t lowBits = access.getJoinLowBits();
+  auto axis = llvm::find(field.getAxisIds().asArrayRef(), operation.getSourceAxis());
+  if (access.getMapping() != "joined" || access.getForm() != "indexed" ||
+      !base || base.value() != 0 || !kernel || group <= 0 || group > 128 ||
+      (group & (group - 1)) != 0 ||
+      fields <= 1 || fields > 8 || access.getBitOffset() % 8 ||
+      access.getJoinRole() != fields - 1 ||
+      !element || !element.isUnsigned() || lowBits <= 0 || lowBits >= width ||
+      fields * lowBits > 8 || 2 * width - lowBits > 8 ||
+      access.getStorageBits() < (fields + 1) * group * 8 ||
+      operation.getSourceCount() != static_cast<uint64_t>(2 * group) ||
+      axis == field.getAxisIds().asArrayRef().end() ||
+      field.getShape()[axis - field.getAxisIds().asArrayRef().begin()] != 2 * group ||
+      operation.getResults().empty())
+    return false;
+  for (mlir::Value value : operation.getResults()) {
+    auto type = mlir::dyn_cast<ValueType>(value.getType());
+    auto lanes = rvvLaneCount(type);
+    if (!type || type != operation.getResults().front().getType() ||
+        !lanes || *lanes <= static_cast<int64_t>(operation.getRepeat()) ||
+        *lanes < 2 * group || type.getLayout().getSew() != 8 ||
+        type.getLayout().getValidity() != "full" ||
+        !supportsRVVLayout(kernel.getTarget(), type.getLayout()) ||
+        type.getLayout().getRegisterGroups() > kernel.getTarget().getVectorRegisters() / 4)
+      return false;
+  }
+  return true;
+}
+
 mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
   ValueType field = getField().getType();
   auto sourceField = getField().getDefiningOp<FieldOp>();
@@ -6885,14 +6929,30 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
                    ? "rvv.regular-repeat-broadcast"
                    : powerOfTwo ? "rvv.regular-repeat-gather.pow2"
                                 : "rvv.regular-repeat-gather.div";
+  if (getLeaf().getInstruction() == "rvv.regular-repeat-joined-unit") {
+    if (!supportsRVVJoinedUnitGather(*this) ||
+        getLeaf().getTemporaryGroups() !=
+            4 * firstResult.getLayout().getRegisterGroups())
+      return emitOpError("joined unit gather requires complete in-bounds byte windows and exact scratch groups");
+    instruction = "rvv.regular-repeat-joined-unit";
+  }
   if (!exactLeaf(getLeaf(), "rvv", "regular-repeat-gather", instruction,
                  "none", "exact"))
     return emitOpError(
         "regular-repeat gather leaf disagrees with its repeat-index geometry");
-  if (getLeaf().getParameters().asArrayRef() !=
-      llvm::ArrayRef<int64_t>(
-          {sourceAxis, axis, static_cast<int64_t>(getSourceCount()),
-           static_cast<int64_t>(getRepeat())}))
+  llvm::SmallVector<int64_t> expectedParameters{
+      sourceAxis, axis, static_cast<int64_t>(getSourceCount()),
+      static_cast<int64_t>(getRepeat())};
+  if (instruction == "rvv.regular-repeat-joined-unit") {
+    const int64_t width = fieldElement.getWidth();
+    const int64_t low = getAccess().getJoinLowBits();
+    const int64_t role = getAccess().getOrder() == "lo_first"
+                             ? getAccess().getJoinRole()
+                             : getAccess().getJoinFields() - 1 - getAccess().getJoinRole();
+    expectedParameters.push_back((role + 1) * low == 8 ? 0 : (int64_t{1} << low) - 1);
+    expectedParameters.push_back(2 * width - low == 8 ? 0 : (int64_t{1} << (width - low)) - 1);
+  }
+  if (getLeaf().getParameters().asArrayRef() != llvm::ArrayRef<int64_t>(expectedParameters))
     return emitOpError(
         "regular-repeat gather leaf does not preserve its selected source/result axis relation");
 
