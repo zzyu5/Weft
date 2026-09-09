@@ -343,6 +343,102 @@ void selectUnsignedNarrowShifts(mlir::ModuleOp module) {
                  << " clustered-splats=" << clusteredSplats << '\n';
 }
 
+void selectReducedScalarScales(mlir::ModuleOp module) {
+  mlir::IRRewriter rewriter(module.getContext());
+  llvm::SmallVector<riscv::RVVPartialFinalizeOp> finalizers;
+  module.walk([&](riscv::RVVPartialFinalizeOp op) { finalizers.push_back(op); });
+  unsigned selected = 0;
+  for (auto finalize : finalizers) {
+    auto combine =
+        finalize.getInput().getDefiningOp<riscv::RVVPartialScaleCombineOp>();
+    auto reduced = combine
+        ? combine.getInput().getDefiningOp<riscv::RVVPartialReduceOp>()
+        : riscv::RVVPartialReduceOp();
+    auto result = mlir::dyn_cast<mlir::IntegerType>(finalize.getResult().getType());
+    auto kernel = finalize->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized() || !combine || !reduced ||
+        combine->getBlock() != finalize->getBlock() ||
+        !combine.getResult().hasOneUse() ||
+        combine.getInput().getType().getSlots() != 1 ||
+        combine.getResult().getType().getSlots() != 1 ||
+        combine.getScales().size() != 1 || combine.getScaleReplicas()[0] != 0 ||
+        combine.getSlotOrder()[0] != 0 || !result || !result.isSigned() ||
+        result.getWidth() != 32 ||
+        finalize.getLeaf().getInstruction() != "rvv.partial-finalize.extract" ||
+        combine.getLeaf().getInstruction() != "rvv.partial-scale-combine")
+      continue;
+    auto source = reduced.getInput().getType().getPartialType();
+    auto sourceElement = mlir::dyn_cast<mlir::IntegerType>(source.getElementType());
+    auto lanes = riscv::rvvLaneCount(source);
+    auto scale = combine.getScales()[0];
+    auto scaleType = mlir::dyn_cast<riscv::ValueType>(scale.getType());
+    bool singleton = scale.getType() == result;
+    if (scaleType && scaleType.getElementType() == result &&
+        scaleType.getLayout().getCarrier() == "scalar" &&
+        scaleType.getLayout().getValidity() == "full") {
+      singleton = true;
+      for (auto factors : {scaleType.getShape(),
+                           scaleType.getLayout().getTimeFactors(),
+                           scaleType.getLayout().getLaneFactors(),
+                           scaleType.getLayout().getReplicaFactors(),
+                           scaleType.getLayout().getFragmentFactors(),
+                           scaleType.getLayout().getLocalFactors()})
+        singleton &= llvm::all_of(factors.asArrayRef(),
+                                  [](int64_t factor) { return factor == 1; });
+    }
+    auto scaleRange = riscv_internal::integerRange(scale);
+    if (!sourceElement || !sourceElement.isSigned() ||
+        sourceElement.getWidth() != 16 ||
+        !lanes || *lanes <= 0 || source.getShape().size() != 1 ||
+        source.getShape()[0] != *lanes || source.getLayout().getValidity() != "full" ||
+        source.getLayout().getTimeFactors()[0] != 1 ||
+        source.getLayout().getReplicaFactors()[0] != 1 ||
+        source.getLayout().getFragmentFactors()[0] != 1 ||
+        source.getLayout().getLocalFactors()[0] != 1 || !singleton || !scaleRange)
+      continue;
+    const __int128 minimum = -(__int128{1} << 15) * *lanes;
+    const __int128 maximum = ((__int128{1} << 15) - 1) * *lanes;
+    const __int128 products[] = {
+        minimum * scaleRange->minimum, minimum * scaleRange->maximum,
+        maximum * scaleRange->minimum, maximum * scaleRange->maximum};
+    if (*std::min_element(std::begin(products), std::end(products)) <
+            -(__int128{1} << 31) ||
+        *std::max_element(std::begin(products), std::end(products)) >=
+            (__int128{1} << 31))
+      continue;
+    // One reduced lane and one coefficient have no vector-chain reuse. The
+    // checked i32 product can use the scalar ALU after the required extraction.
+    rewriter.setInsertionPoint(combine);
+    if (scaleType) {
+      auto zero = rewriter.create<mlir::arith::ConstantIndexOp>(finalize.getLoc(), 0);
+      llvm::SmallVector<mlir::Value> indices(scaleType.getShape().size(), zero);
+      llvm::SmallVector<mlir::Attribute> selectors(
+          scaleType.getShape().size(), rewriter.getStringAttr("index"));
+      scale = rewriter.create<riscv::ExtractOp>(
+          finalize.getLoc(), result, scale, indices, rewriter.getArrayAttr(selectors),
+          riscv::AccessAttr::get(rewriter.getContext(), "unit", "dense", 1, 0, 0,
+                                 0, 0, 0, 0, 0, 0, 0, "none"),
+          riscv_internal::leaf(rewriter, "transfer", "extract",
+                               "rvv.extract.unit", "rvv.extract.unit", 0, 0));
+    }
+    finalize.getInputMutable().assign(combine.getInput());
+    // Consume the coefficient at the original combine point, including any
+    // deferred field projection. Only the pure partial extraction moves here.
+    rewriter.moveOpBefore(finalize, combine);
+    rewriter.setInsertionPoint(combine);
+    auto product = rewriter.create<riscv::BinaryOp>(
+        finalize.getLoc(), result, finalize.getResult(), scale, "mul",
+        riscv_internal::leaf(rewriter, "scalar", "pointwise", "scalar.mul",
+                             "scalar.mul", 0, 0));
+    riscv_internal::copyOrigin(combine, product);
+    finalize.getResult().replaceAllUsesExcept(product.getResult(), product);
+    rewriter.eraseOp(combine);
+    ++selected;
+  }
+  if (selected)
+    llvm::errs() << "weft-scalar-reduced-scale: selected=" << selected << '\n';
+}
+
 mlir::LogicalResult materializeFieldReads(mlir::ModuleOp module) {
   mlir::IRRewriter rewriter(module.getContext());
   llvm::SmallVector<riscv::ConvertLayoutOp> candidates;
@@ -543,6 +639,7 @@ public:
       return;
     }
     selectUnsignedNarrowShifts(getOperation());
+    selectReducedScalarScales(getOperation());
   }
 };
 

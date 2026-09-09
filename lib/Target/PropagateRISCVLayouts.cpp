@@ -1959,6 +1959,7 @@ public:
     llvm::DenseMap<mlir::Value, int64_t> valueLMULBounds;
     for (mlir::Value value : values)
       valueLMULBounds[value] = lmulEighths;
+    llvm::DenseSet<mlir::Value> pointwiseDerivedWidths;
     bool widthChanged = true;
     while (widthChanged) {
       widthChanged = false;
@@ -1998,6 +1999,36 @@ public:
           };
           propagateWidth(input, inputSEW, result, resultSEW);
           propagateWidth(result, resultSEW, input, inputSEW);
+          return;
+        }
+
+        // A pointwise consumer preserves the lane span already derived from
+        // widening. Resetting its result to the base width would immediately
+        // strip-mine that same numerical chain back into smaller issues.
+        if (mlir::isa<riscv::BinaryOp, riscv::UnaryOp>(operation)) {
+          mlir::Value result = operation->getResult(0);
+          auto resultType = mlir::dyn_cast<riscv::ValueType>(result.getType());
+          if (!resultType ||
+              !mlir::isa<mlir::IntegerType>(resultType.getElementType()) ||
+              !roles[result].laneAxis || roles[result].local ||
+              roles[result].ime)
+            return;
+          for (mlir::Value input : operation->getOperands()) {
+            auto inputType = mlir::dyn_cast<riscv::ValueType>(input.getType());
+            if (!inputType ||
+                inputType.getElementType() != resultType.getElementType() ||
+                inputType.getShape() != resultType.getShape() ||
+                inputType.getAxisIds() != resultType.getAxisIds() ||
+                roles[input].laneAxis != roles[result].laneAxis ||
+                roles[input].local || roles[input].ime)
+              continue;
+            const int64_t width = valueLMULBounds.lookup(input);
+            if (width > valueLMULBounds.lookup(result)) {
+              valueLMULBounds[result] = width;
+              pointwiseDerivedWidths.insert(result);
+              widthChanged = true;
+            }
+          }
           return;
         }
 
@@ -2048,6 +2079,10 @@ public:
         }
       });
     }
+
+    if (!pointwiseDerivedWidths.empty())
+      llvm::errs() << "weft-pointwise-width: propagated-values="
+                   << pointwiseDerivedWidths.size() << '\n';
 
     // Each physical value receives the largest lane span legal for its own
     // type and the instantiated LMUL bound.  Structured-product operands and

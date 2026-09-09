@@ -429,6 +429,121 @@ bool sinkIntegerSlice(mlir::Operation *root, mlir::IRRewriter &rewriter,
   return false;
 }
 
+bool prepareScalarFloatingSlice(mlir::Operation *root,
+                                mlir::IRRewriter &rewriter,
+                                unsigned &overlappedRegisterIssues) {
+  auto factor = mlir::dyn_cast<riscv::BinaryOp>(root);
+  if (!factor || factor.getKind() != "mul" || root->getNumResults() != 1 ||
+      !mlir::isa<mlir::FloatType>(root->getResult(0).getType()) ||
+      !root->getResult(0).hasOneUse() ||
+      mlir::isa<riscv::RegisterMaterializeOp>(
+          *root->getResult(0).getUsers().begin()))
+    return false;
+  auto *block = root->getBlock();
+  llvm::SmallPtrSet<mlir::Operation *, 8> slice;
+  llvm::SmallVector<mlir::Value> worklist{root->getResult(0)};
+  bool hasField = false;
+  while (!worklist.empty()) {
+    auto value = worklist.pop_back_val();
+    auto *definition = value.getDefiningOp();
+    if (!definition || !mlir::isa<mlir::FloatType>(value.getType()))
+      return false;
+    if (mlir::isa<riscv::ConstantOp, mlir::arith::ConstantOp>(definition))
+      continue;
+    if (definition->getBlock() != block || !value.hasOneUse() ||
+        !mlir::isMemoryEffectFree(definition) || definition->getNumRegions())
+      return false;
+    if (slice.contains(definition))
+      continue;
+    if (slice.size() == 8)
+      return false;
+    slice.insert(definition);
+    if (mlir::isa<riscv::FieldOp>(definition)) {
+      hasField = true;
+      continue;
+    }
+    auto multiply = mlir::dyn_cast<riscv::BinaryOp>(definition);
+    if (!mlir::isa<riscv::WidenOp, riscv::CastOp>(definition) &&
+        (!multiply || multiply.getKind() != "mul"))
+      return false;
+    llvm::append_range(worklist, definition->getOperands());
+  }
+  if (!hasField)
+    return false;
+  llvm::SmallPtrSet<mlir::Operation *, 16> dependencies;
+  for (auto *operation : slice)
+    for (auto operand : operation->getOperands())
+      if (auto *definition = operand.getDefiningOp();
+          definition && definition->getBlock() == block &&
+          !slice.contains(definition))
+        dependencies.insert(definition);
+  mlir::Operation *anchor = nullptr;
+  unsigned distance = 0;
+  unsigned vectorRegisterIssues = 0;
+  bool crossesReduction = false;
+  for (auto *cursor = root->getPrevNode(); cursor && distance < 64;
+       cursor = cursor->getPrevNode(), ++distance) {
+    if (slice.contains(cursor))
+      continue;
+    if (dependencies.contains(cursor) || cursor->getNumRegions() ||
+        !canPreserveProducerResult(cursor))
+      break;
+    auto leaf = cursor->getAttrOfType<riscv::LeafAttr>("leaf");
+    if (leaf && leaf.getEngine() == "rvv") {
+      llvm::SmallDenseSet<mlir::Value, 8> scalarInputs;
+      bool scalarTuple = false;
+      for (mlir::Value operand : cursor->getOperands()) {
+        auto type = mlir::dyn_cast<riscv::ValueType>(operand.getType());
+        if ((!type || type.getLayout().getCarrier() == "scalar") &&
+            mlir::isa<mlir::IntegerType, mlir::IndexType>(
+                riscv_internal::logicalElement(operand.getType())) &&
+            !operand.getDefiningOp<riscv::ConstantOp>() &&
+            !operand.getDefiningOp<mlir::arith::ConstantOp>()) {
+          scalarInputs.insert(operand);
+          if (type)
+            for (auto factors : {type.getLayout().getTimeFactors(),
+                                 type.getLayout().getReplicaFactors()})
+              scalarTuple |= llvm::any_of(factors.asArrayRef(),
+                                          [](int64_t factor) { return factor > 1; });
+        }
+      }
+      // Do not overlap address/conversion preparation with a multi-coefficient
+      // GPR consumer. Its scalar inputs have not reached their last uses yet.
+      if (scalarTuple || scalarInputs.size() > 1)
+        break;
+    }
+    anchor = cursor;
+    if (leaf && leaf.getEngine() == "rvv")
+      vectorRegisterIssues += std::max<int64_t>(
+          1, std::max(leaf.getOperandGroups(), leaf.getResultGroups()));
+    crossesReduction |= mlir::isa<riscv::RVVFinalizeWidenDotOp,
+                                  riscv::RVVPartialFinalizeOp,
+                                  riscv::RVVWidenReduceOp, riscv::ReduceOp>(cursor);
+    // Keep the shortest independent window that can cover this scalar slice
+    // in the register-issue estimate; earlier placement only extends lifetime.
+    if (crossesReduction && vectorRegisterIssues >= slice.size())
+      break;
+  }
+  if (!anchor || !crossesReduction || vectorRegisterIssues < slice.size())
+    return false;
+  llvm::SmallVector<mlir::Operation *> ordered;
+  for (auto &operation : *block)
+    if (slice.contains(&operation))
+      ordered.push_back(&operation);
+  if (ordered.empty() || ordered.front()->isBeforeInBlock(anchor))
+    return false;
+  for (auto *operation : ordered)
+    rewriter.moveOpBefore(operation, anchor);
+  rewriter.setInsertionPointAfter(root);
+  auto prepared = rewriter.create<riscv::RegisterMaterializeOp>(
+      root->getLoc(), root->getResult(0).getType(), root->getResult(0),
+      -1, -1, -1, "physical-share");
+  riscv_internal::copyOrigin(root, prepared);
+  root->getResult(0).replaceAllUsesExcept(prepared.getResult(), prepared);
+  overlappedRegisterIssues += vectorRegisterIssues;
+  return true;
+}
+
 mlir::LogicalResult rebindFieldReadProjections(
     riscv::KernelOp kernel, mlir::IRRewriter &rewriter) {
   llvm::SmallVector<riscv::FieldReadOp> reads;
@@ -625,6 +740,30 @@ public:
     for (riscv::KernelOp kernel : getOperation().getOps<riscv::KernelOp>()) {
       if (kernel.getResourcesMaterialized())
         continue;
+      llvm::DenseMap<mlir::Block *, unsigned> preparedPerBlock;
+      llvm::SmallVector<mlir::Operation *> scalarFloating;
+      kernel.walk([&](mlir::Operation *operation) {
+        if (auto materialize = mlir::dyn_cast<riscv::RegisterMaterializeOp>(operation);
+            materialize && materialize.getRealization() == "physical-share" &&
+            mlir::isa<mlir::FloatType>(
+                riscv_internal::logicalElement(
+                    materialize.getResult().getType())))
+          ++preparedPerBlock[operation->getBlock()];
+        if (operation->getNumResults() == 1 &&
+            mlir::isa<mlir::FloatType>(operation->getResult(0).getType()))
+          scalarFloating.push_back(operation);
+      });
+      unsigned preparedSlices = 0, overlap = 0;
+      for (auto *operation : llvm::reverse(scalarFloating))
+        if (preparedPerBlock.lookup(operation->getBlock()) < 4 &&
+            prepareScalarFloatingSlice(operation, rewriter, overlap)) {
+          ++preparedPerBlock[operation->getBlock()];
+          ++preparedSlices;
+        }
+      if (preparedSlices)
+        llvm::errs() << "weft-scalar-prepare: selected=" << preparedSlices
+                     << " estimated-overlapped-register-issues=" << overlap
+                     << '\n';
       llvm::SmallVector<mlir::Operation *> pointwise;
       kernel.walk([&](mlir::Operation *operation) {
         if (isIntegerPointwise(operation))

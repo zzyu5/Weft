@@ -29,7 +29,7 @@
     "row-dequantize:k1 tq1_0": {"entry":"tq1_0.py","symbol":"row_dequantize_tq1_0","source":{},"physical":{}},
     "row-dequantize:k1 tq2_0": {"entry":"tq2_0.py","symbol":"row_dequantize_tq2_0","source":{},"physical":{}},
     "row-dequantize:sg2044 iq1_m": {"entry":"iq1_m.py","symbol":"row_dequantize_iq1_m","source":{},"physical":{}},
-    "row-dequantize:sg2044 iq1_s": {"entry":"iq1_s.py","symbol":"row_dequantize_iq1_s","source":{},"physical":{}},
+    "row-dequantize:sg2044 iq1_s": {"entry":"iq1_s.py","symbol":"row_dequantize_iq1_s","source":{},"physical":{"lmul_eighths":64},"binding_origin":"targeted-rerun"},
     "row-dequantize:sg2044 iq2_s": {"entry":"iq2_s.py","symbol":"row_dequantize_iq2_s","source":{},"physical":{"lmul_eighths":64}},
     "row-dequantize:sg2044 iq2_xs": {"entry":"iq2_xs.py","symbol":"row_dequantize_iq2_xs","source":{},"physical":{}},
     "row-dequantize:sg2044 iq2_xxs": {"entry":"iq2_xxs.py","symbol":"row_dequantize_iq2_xxs","source":{},"physical":{"lmul_eighths":16}},

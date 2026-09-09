@@ -123,7 +123,11 @@ bounded register reduction 可以保留一致的 free-axis memory supply，以 r
 表示被消除轴；结果必须逐轴保留其余 mapping，不强制将归约轴搬入 SIMD lane。
 已实例化的 LMUL binding 是基础表示宽度，不是所有 SSA 值的统一上限。
 保持同一 logical lane span 的 cast/widen/narrow 链会按 SEW 比例唯一派生每个值的
-LMUL；widening contraction 的两个 operand 再共享该 lane span。一维同轴的宽度转换还须
+LMUL；同整数元素类型、同 shape/axis/lane axis 的普通逐元素 consumer 继续保留这个派生宽度，
+不能在下一次 add/mul 等运算处重置为基础 binding，立即把同一数值链重新拆成较小 issue。
+传播仅前向增加 result 的合法宽度，不改变计算图、storage layer 上限或最终资源判据。
+`weft-pointwise-width` 输出实际派生宽度的 value 数，不将这项计数当成最终指令减少数。
+widening contraction 的两个 operand 再共享该 lane span。一维同轴的宽度转换还须
 按 operand SEW 与目标最大合法 LMUL 限制 result lane capacity，其余元素保留为 issue time；
 不能让窄 result 要求无法表示的宽 operand。没有合法派生 LMUL 或最终联合 live set
 超资源时，当前 candidate 失败，不回头改作者树。
@@ -540,6 +544,13 @@ validity，输入 SEW/LMUL 为结果的两倍；旧 shift 的 exact leaf 也须�
 仍由后续资源主链核算。`weft-narrow-shift` 输出融合数和重排的 splat 数；emitter 不识别
 producer 模式。每次融合消除一个已有 shift，不复制 shift producer，工作表有输入 DAG 上界。
 
+单 slot 的已归约 i32 partial，若仅由一个 singleton i32 scale 相乘后立即提取为标量，
+可选择已有 scalar mul，不再做 VL1 vector multiply。原 partial 必须来自完整一维 i16
+carrier 的 widening reduction；以完整 i16 元素范围、lane 数和 scale 的静态整数范围
+证明最终乘积始终在 i32 内。不改变 reduction、scale 的结合位置或数值宽度；仅将纯
+partial extract 放到原 combine 处，系数仍在原消费点读取，不能把 deferred read 向后移。
+singleton shaped scale 使用显式 index-zero extract，资源继续走同一收尾主链。
+
 ### `SelectRISCVScalarLoadPrimes`
 
 该pass消费已经实例化的boolean physical parameter，并且只在`FinalizeRISCVLeaves`之后运行。
@@ -593,6 +604,18 @@ region-aware 资源分析的峰值不超过 target 寄存器预算时接受。�
 旁的配置提供并通过真实运行选择。最终资源 pass 重新核算实际选择的 Physical graph。
 
 ### `MaterializeRISCVResources`
+
+资源冻结前，可提前准备同 block 的单消费者标量浮点乘法因子：限普通 scalar
+`field/widen/cast/mul` 纯链，最多8个节点、向前最多64个操作；完整表达式及内部次序不变。
+只能越过独立的 pure/read 操作，不能越过输入定义、region、write 或未知 effect，不能
+把原字段读取向后移动。窗口须跨 reduction；RVV leaf 的 operand/result register groups
+最大值作为有界 issue 估计，优先取能够覆盖该 scalar 链的最近窗口，以减少额外驻留。
+窗口不能越过同时消费多个非常量整数 scalar 的 RVV op，避免准备字段地址/转换时延长
+多系数 GPR live set；不能提供完整 scalar 链 issue 覆盖的窗口不选。
+结果用既有 `register_materialize physical-share` 在选定点物化，terminal 不再决定调度。
+每 block 最多4个准备操作，已有 scalar/ScalarTuple 浮点 physical-share 也计入预算，
+清 resource marker 后重放不重复放大预算。`weft-scalar-prepare` 输出选中数和预计重叠的
+register issues；估计不是周期预测，也不覆盖 effect、数值或最终资源合法性。
 
 用 region-aware SSA live interval和 leaf temporary计算 vector/fragment peak，并把每个 leaf 的
 operand/result resource groups写实。首次核算前，可将同 block、single-use 的纯整数计算链
