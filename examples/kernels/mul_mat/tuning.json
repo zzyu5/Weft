@@ -26,7 +26,7 @@
     "mul-mat:k1 iq3_s prefill": {"entry":"iq3_s.py","symbol":"production_mul_mat_iq3_s","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
     "mul-mat:k1 iq3_xxs decode": {"entry":"iq3_xxs.py","symbol":"production_mul_mat_iq3_xxs","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
     "mul-mat:k1 iq3_xxs prefill": {"entry":"iq3_xxs.py","symbol":"production_mul_mat_iq3_xxs","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
-    "mul-mat:k1 iq4_nl decode": {"entry":"iq4_nl_decode.py","symbol":"production_mul_mat_iq4_nl_decode","source":{},"physical":{"unroll":1,"pipeline_depth":1}},
+    "mul-mat:k1 iq4_nl decode": {"entry":"iq4_nl_decode.py","symbol":"production_mul_mat_iq4_nl_decode","source":{},"physical":{"unroll":2,"pipeline_depth":1},"binding_origin":"targeted-rerun"},
     "mul-mat:k1 iq4_nl prefill": {"entry":"iq4_nl.py","symbol":"production_mul_mat_iq4_nl","source":{"NC":32,"MC":16,"MR":2,"NR":4},"physical":{"unroll":1,"pipeline_depth":1},"binding_origin":"measured-source-subset"},
     "mul-mat:k1 iq4_xs decode": {"entry":"iq4_xs_decode.py","symbol":"production_mul_mat_iq4_xs_decode","source":{},"physical":{"unroll":1,"pipeline_depth":1}},
     "mul-mat:k1 iq4_xs prefill": {"entry":"iq4_xs.py","symbol":"production_mul_mat_iq4_xs","source":{"NC":32,"MC":16,"MR":2,"NR":4},"physical":{"unroll":1,"pipeline_depth":1}},

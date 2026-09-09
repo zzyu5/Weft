@@ -130,9 +130,13 @@ LMUL；widening contraction 的两个 operand 再共享该 lane span。一维同
 整除的 proper domain Extract 是投影，不是父子 lane-span 等价关系：子域可以使用更窄的
 carrier，但不能反向压缩父值。父值保持独立合法表示，后续 typed extract 或 partitioned
 reduction 消费它；逻辑分组、数值宽度与 reduction 边界不改变。
-当 encoded field 经过保持 shape/axis 的 conversion 或作为 lookup index 流向下游时，
-storage layer 宽度同样沿这条 use-def 链传播；target 不能因此把超过真实
-grouped/layered 宽度的逻辑 lane 伪装成一次 indexed load。
+storage layer 宽度约束 raw field 和保持表示的 cast/conversion 链；lookup 产生新的
+数值结果，不继承其 indices 来源的 storage lane 上限。读取与查询的不同 lane span
+由显式表示转换连接，不能把超过 grouped/layered 宽度的逻辑 lane 伪装成一次读取。
+完整 register table 与查询使用相同 SEW/LMUL，但有效 table 元素数可以少于查询 lanes。
+table 完整元素能放入所需 register capacity 时，shared materialize 或同 SEW 的单消费者
+table load 可匹配查询的 LMUL；原读取点、逻辑 extent、VL 和 lane/time mapping 均不改变。
+不同 SEW 的 memory lookup 不属于该寄存器匹配候选，仍由 typed indexed-memory 关系选择。
 
 同一个 widening contraction 的两个 operand 必须共享一套 reduction carrier。两侧
 storage proposal 一致时保留该 mapping；不一致但拥有相同 reduction axes 与 extents 时，
@@ -249,6 +253,11 @@ conversion 的同 block 区间没有写入或未知 effect，允许移除这条�
 indexed Extract 的 index 投影可以沿单 use 纯 pointwise 链和 iota 重物化；预检查至多访问
 32 个索引节点，并逐输入核对可执行的 layout projection。不能直接拼接旧 lane parts，
 不等于该纯 index 程序不能在目标 layout 中重新形成；memory producer 不由这条规则复制。
+若 Extract 仍投影 grouped/layered storage，不能把超过对应 storage layer 的 SIMD lane
+span 向读取侧重物化；保留合法窗口读取后的显式 numeric pack，而不是制造未闭合的跨层读取。
+若最小合法 LMUL 使 source part 留有空余 capacity，part-to-lane pack 仍按 pieces 倍率
+使用闭合的中间 carrier，再显式缩到 consumer LMUL；pure conversion 合成不得消除这个
+必需中间表示。两条边保持完整逻辑坐标、VL 与读取点，资源按实际 carrier 重新闭合。
 
 单 use memory lookup 接 scalar conversion 时，在同 block 无跨写入的条件下，可以将
 indices 投影为 consumer 的 scalar time/replica mapping 并直接 scalar lookup。新的 memory
@@ -545,6 +554,8 @@ shape、axes 和 Level 归属保持不变。私有 local writes 不与 pinned Vi
 copy leaf 在 target 合法的 m1/m2/m4 中按精确 transfer 次数与 scratch 占用选择，并记录
 全部所需参数。它完成显式 exact-window transfer，不把热路径交给带未知向量 clobber
 的库函数调用。
+已有 snapshot storage operand 的 load 保留这个已验证的 copy leaf；重放 memory planning
+不能把它改回普通 load，清 resource marker 也不改变 snapshot 的归属和读取合同。
 
 ### `CloseRISCVLeafResources`
 

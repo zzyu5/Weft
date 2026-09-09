@@ -11,7 +11,7 @@
     "vec-dot:k1 iq2_xxs": {"entry":"iq2_xxs_q8_k.py","symbol":"quantized_vec_dot_iq2_xxs_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":4,"pipeline_depth":1}},
     "vec-dot:k1 iq3_s": {"entry":"iq3_s_q8_k.py","symbol":"quantized_vec_dot_iq3_s_q8_k","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
     "vec-dot:k1 iq3_xxs": {"entry":"iq3_xxs_q8_k.py","symbol":"quantized_vec_dot_iq3_xxs_q8_k","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
-    "vec-dot:k1 iq4_nl": {"entry":"iq4_nl_q8_0.py","symbol":"quantized_vec_dot_iq4_nl_q8_0","source":{},"physical":{}},
+    "vec-dot:k1 iq4_nl": {"entry":"iq4_nl_q8_0.py","symbol":"quantized_vec_dot_iq4_nl_q8_0","source":{},"physical":{"unroll":2},"binding_origin":"targeted-rerun"},
     "vec-dot:k1 iq4_xs": {"entry":"iq4_xs_q8_k.py","symbol":"quantized_vec_dot_iq4_xs_q8_k","source":{},"physical":{}},
     "vec-dot:k1 mxfp4": {"entry":"mxfp4_q8_0.py","symbol":"quantized_vec_dot_mxfp4_q8_0","source":{},"physical":{}},
     "vec-dot:k1 nvfp4": {"entry":"nvfp4_q8_0.py","symbol":"quantized_vec_dot_nvfp4_q8_0","source":{},"physical":{}},

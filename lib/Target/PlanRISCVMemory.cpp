@@ -2854,6 +2854,10 @@ public:
     llvm::DenseMap<mlir::Value, mlir::Value> tableSnapshots;
     if (!nestedDomainOnly) {
     getOperation().walk([&](riscv::LoadOp operation) {
+      // ReadSnapshots owns the allocated copy and its exact transfer leaf.
+      // Replaying memory selection must not turn that copy into a plain load.
+      if (operation.getSnapshotStorage())
+        return;
       auto memory = operation.getRegion().getType();
       auto encoding = mlir::cast<kernel::EncodingType>(memory.getEncoding());
       llvm::StringRef mapping = encoding.getKind() == "dense" ? "dense" : "opaque";

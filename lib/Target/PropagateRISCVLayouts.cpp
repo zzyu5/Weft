@@ -1481,8 +1481,10 @@ std::optional<int64_t> encodedLaneLimit(mlir::Value value, int64_t laneAxis) {
       return visit(materialize.getInput());
     if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition))
       return visit(extract.getInput());
-    if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(definition))
-      return visit(lookup.getIndices());
+    // Lookup computes a new value; its indices' storage layer does not bound
+    // that value's carrier. Operand mismatches remain explicit conversions.
+    if (mlir::isa<riscv::LookupOp>(definition))
+      return std::nullopt;
     // Storage-layer width constrains the raw field and representation-only
     // casts, not a newly computed logical value.  In particular, combining
     // low/high bit layers creates a full logical vector that may be
@@ -2191,11 +2193,17 @@ public:
       auto materialize = riscv_internal::stripRepresentationConversions(
                              lookup.getTable())
                              .getDefiningOp<riscv::MaterializeOp>();
+      auto directLoad = lookup.getTable().getDefiningOp<riscv::LoadOp>();
       auto table = mlir::dyn_cast<riscv::ValueType>(lookup.getTable().getType());
       auto indices =
           mlir::dyn_cast<riscv::ValueType>(lookup.getIndices().getType());
       auto result = mlir::dyn_cast<riscv::ValueType>(lookup.getResult().getType());
-      if (!materialize || materialize.getPlacement() != "shared" || !table ||
+      const bool sharedTable = materialize && materialize.getPlacement() == "shared";
+      const bool singleUseRead = directLoad && directLoad.getResult().hasOneUse() &&
+          table && indices && result &&
+          table.getLayout().getSew() == result.getLayout().getSew() &&
+          indices.getLayout().getSew() == result.getLayout().getSew();
+      if ((!sharedTable && !singleUseRead) || !table ||
           !indices || !result || table.getLayout().getCarrier() != "rvv" ||
           indices.getLayout().getCarrier() != "rvv" ||
           result.getLayout().getCarrier() != "rvv")
@@ -2229,8 +2237,14 @@ public:
         setValueLayout(value,
                        withRegisterWidth(builder, type.getLayout(), requiredLMUL));
       };
-      update(materialize.getInput());
-      update(materialize.getResult());
+      if (sharedTable) {
+        update(materialize.getInput());
+        update(materialize.getResult());
+      } else {
+        // Preserve this read point and its logical extent. Only its unused
+        // physical register capacity changes to match the sole lookup use.
+        update(directLoad.getResult());
+      }
     });
     if (mlir::failed(weft::planRISCVResidency(getOperation()))) {
       signalPassFailure();

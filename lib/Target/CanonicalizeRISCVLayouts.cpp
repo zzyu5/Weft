@@ -157,11 +157,20 @@ public:
                   previous.getInput().getType());
               auto target = mlir::cast<riscv::ValueType>(
                   conversion.getResult().getType());
+              auto composedEdge = riscv_internal::layoutConversion(
+                  rewriter, source.getLayout(), target.getLayout());
+              // A closed pack may need a larger intermediate carrier before
+              // a lane-preserving resize. Do not compose away that contract.
+              if (isRegisterCarrierResize(conversion) &&
+                  riscv::rvvPartToLanePieces(source, previous.getResult().getType()) &&
+                  (composedEdge.getKind() == "register_to_lane" ||
+                   composedEdge.getKind() == "time_to_lane") &&
+                  !riscv::rvvPartToLanePieces(source, target))
+                continue;
               rewriter.setInsertionPoint(conversion);
               auto composed = rewriter.create<riscv::ConvertLayoutOp>(
                   conversion.getLoc(), target, previous.getInput(),
-                  riscv_internal::layoutConversion(
-                      rewriter, source.getLayout(), target.getLayout()),
+                  composedEdge,
                   riscv::AccessAttr(),
                   riscv_internal::unselectedLeaf(rewriter));
               conversion.getResult().replaceAllUsesWith(composed.getResult());
@@ -350,6 +359,26 @@ public:
           auto targetType =
               mlir::cast<riscv::ValueType>(conversion.getResult().getType());
           auto kernel = conversion->getParentOfType<riscv::KernelOp>();
+          if (auto field = riscv::fieldReadProjection(extract.getResult())) {
+            auto facts = riscv_internal::fieldFacts(field);
+            auto fieldType = mlir::dyn_cast<riscv::ValueType>(field.getResult().getType());
+            bool crossesLayer = false;
+            if (fieldType && facts.mapping == "grouped_layered" && facts.layer > 0 &&
+                facts.logicalRank > 0 &&
+                facts.logicalRank <= static_cast<int64_t>(fieldType.getAxisIds().size())) {
+              for (int64_t axis : fieldType.getAxisIds().asArrayRef().take_back(
+                       static_cast<size_t>(facts.logicalRank))) {
+                auto found = llvm::find(targetType.getAxisIds().asArrayRef(), axis);
+                if (found != targetType.getAxisIds().asArrayRef().end())
+                  crossesLayer |= targetType.getLayout().getLaneFactors()[
+                      found - targetType.getAxisIds().asArrayRef().begin()] > facts.layer;
+              }
+            }
+            // A wider numeric pack is legal without making the storage read
+            // itself a cross-layer access. Keep that representation edge.
+            if (crossesLayer)
+              continue;
+          }
           if (extract->hasAttr("index_pattern")) {
             rewriter.setInsertionPoint(conversion);
             auto rematerialized = rewriter.create<riscv::ExtractOp>(
@@ -582,6 +611,64 @@ public:
       });
     }
 
+    llvm::SmallVector<riscv::ConvertLayoutOp> packs;
+    getOperation().walk([&](riscv::ConvertLayoutOp conversion) {
+      packs.push_back(conversion);
+    });
+    for (auto conversion : packs) {
+      const auto kind = conversion.getConversion().getKind();
+      if (hasFinalResourceContract(conversion) ||
+          !isPureRepresentationConversion(conversion) ||
+          (kind != "register_to_lane" && kind != "time_to_lane"))
+        continue;
+      auto source = conversion.getInput().getType();
+      auto target = conversion.getResult().getType();
+      auto sourceLanes = riscv::rvvLaneCount(source);
+      auto targetLanes = riscv::rvvLaneCount(target);
+      if (!sourceLanes || !targetLanes || *sourceLanes <= 0 ||
+          *targetLanes <= *sourceLanes || *targetLanes % *sourceLanes ||
+          riscv::rvvPartToLanePieces(source, target))
+        continue;
+      const int64_t pieces = *targetLanes / *sourceLanes;
+      const int64_t sourceLMUL = source.getLayout().getLmulEighths();
+      if (sourceLMUL <= 0 || pieces > 64 / sourceLMUL)
+        continue;
+      const int64_t packLMUL = sourceLMUL * pieces;
+      auto layout = target.getLayout();
+      if (packLMUL <= layout.getLmulEighths())
+        continue;
+      auto replicas = riscv_internal::staticProduct(
+          layout.getReplicaFactors().asArrayRef());
+      auto kernel = conversion->getParentOfType<riscv::KernelOp>();
+      if (!replicas || *replicas <= 0 || !kernel ||
+          *replicas > kernel.getTarget().getVectorRegisters() /
+                          ((packLMUL + 7) / 8))
+        continue;
+      auto packLayout = riscv::LayoutAttr::get(
+          rewriter.getContext(), layout.getCarrier(), layout.getAxisIds(),
+          layout.getTimeFactors(), layout.getLaneFactors(),
+          layout.getReplicaFactors(), layout.getFragmentFactors(),
+          layout.getLocalFactors(), layout.getSew(), packLMUL, layout.getVl(),
+          ((packLMUL + 7) / 8) * *replicas, layout.getValidity());
+      auto packType = mlir::cast<riscv::ValueType>(
+          riscv_internal::withLayout(target, packLayout));
+      if (!riscv::supportsRVVLayout(kernel.getTarget(), packLayout) ||
+          !riscv::rvvPartToLanePieces(source, packType))
+        continue;
+      // Minimum LMUL can leave unused capacity in each source part. Pack
+      // those numeric parts in their relative carrier, then explicitly resize
+      // to the consumer; neither step changes the logical lanes or read point.
+      rewriter.setInsertionPoint(conversion);
+      auto pack = rewriter.create<riscv::ConvertLayoutOp>(
+          conversion.getLoc(), packType, conversion.getInput(),
+          riscv_internal::layoutConversion(rewriter, source.getLayout(), packLayout),
+          riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+      riscv_internal::copyOrigin(conversion, pack);
+      conversion.getInputMutable().assign(pack.getResult());
+      conversion.setConversionAttr(
+          riscv_internal::layoutConversion(rewriter, packLayout, layout));
+      conversion.setLeafAttr(riscv_internal::unselectedLeaf(rewriter));
+    }
   }
 };
 

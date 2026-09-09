@@ -11,7 +11,7 @@
     "row-dequantize:k1 iq2_xxs": {"entry":"iq2_xxs.py","symbol":"row_dequantize_iq2_xxs","source":{},"physical":{"lmul_eighths":16}},
     "row-dequantize:k1 iq3_s": {"entry":"iq3_s.py","symbol":"row_dequantize_iq3_s","source":{},"physical":{}},
     "row-dequantize:k1 iq3_xxs": {"entry":"iq3_xxs.py","symbol":"row_dequantize_iq3_xxs","source":{},"physical":{}},
-    "row-dequantize:k1 iq4_nl": {"entry":"iq4_nl.py","symbol":"row_dequantize_iq4_nl","source":{},"physical":{}},
+    "row-dequantize:k1 iq4_nl": {"entry":"iq4_nl.py","symbol":"row_dequantize_iq4_nl","source":{},"physical":{"lmul_eighths":32},"binding_origin":"targeted-rerun"},
     "row-dequantize:k1 iq4_xs": {"entry":"iq4_xs.py","symbol":"row_dequantize_iq4_xs","source":{},"physical":{}},
     "row-dequantize:k1 mxfp4": {"entry":"mxfp4.py","symbol":"row_dequantize_mxfp4","source":{},"physical":{}},
     "row-dequantize:k1 nvfp4": {"entry":"nvfp4.py","symbol":"row_dequantize_nvfp4","source":{},"physical":{}},
