@@ -134,7 +134,7 @@ mlir::LogicalResult verifyDescriptorFacts(mlir::Operation *owner,
 
 bool requiresIntegerWidening(mlir::Operation *operation) {
   if (mlir::isa<riscv::RVVGroupedMacStepOp, riscv::RVVWidenDotOp,
-                riscv::RVVWidenAddOp,
+                riscv::RVVWidenAddOp, riscv::RVVNarrowShiftRightOp,
                 riscv::RVVPartialSetOp,
                 riscv::RVVPartialCaptureOp, riscv::RVVPartialCollectOp,
                 riscv::RVVPartialRepackOp,
@@ -846,7 +846,7 @@ public:
             riscv::CompareOp, riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
             riscv::RVVSplatOp, riscv::RVVBitmaskDecodeOp,
             riscv::RVVSignedBitmaskReduceOp, riscv::RVVMaskedNegateOp,
-            riscv::RVVWidenAddOp,
+            riscv::RVVWidenAddOp, riscv::RVVNarrowShiftRightOp,
             riscv::RVVBitmaskWindowLoadOp,
             riscv::RVVGroupedMacStepOp, riscv::RVVLayeredRecordLoadOp,
             riscv::RVVLayeredWindowOp,

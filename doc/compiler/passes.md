@@ -180,7 +180,8 @@ indexed-entry 的地址索引若仅由同形、同轴的 unsigned 8/16-bit value
 u16/u32 read 的 byte-aligned shift 加 `&255`，或非饱和 `rtz` 的低字节窄化链；shift 的
 byte selector 必须经有界 use-def 与范围证明位于原 word 内。encoded field 必须是
 little-endian、完整的一维 natural storage；dense descriptor 必须连续。word 到最终投影
-的中间链只能有唯一消费者，读取与投影间不能跨 effect，不能把已物化 register table
+的中间链只能有唯一消费者；读取与投影之间最多检查 256 个同 block 操作，可跨普通
+只读 effect，但拒绝写入、分配/释放、未知 effect 和 region。不能把已物化 register table
 改为重新读内存。返回字节以显式 widening 恢复原消费者的类型与 layout，不改变数值图。
 该 widening 也适用上述 indexed-entry 16-bit 地址规则，包括较早 nested-memory pass
 已选中的 entry edge；不为其它 32-bit 解码链追加窄化。
@@ -504,6 +505,18 @@ emitter 沿用已选 shift/and 的拼写，资源由同一后续主链闭合。
 恰好恢复原 vector type，则三步选择为单个 `rvv_multiply_high_scalar`。匹配只检查这条
 固定 use-def 链；u8/u16 的 doubled-width unsigned product 不溢出，前置 wrap、后续
 累加/归约与全部 axes 不变。emitter 只拼写该已选 leaf，资源由原有收尾重新核算。
+
+同 block 的 unsigned `shr` 若只被非饱和、rtz 的二倍窄化消费，可选择
+`rvv_narrow_shift_right`，精确拼写 `vnsrl.wv/wx`。输入与结果须有相同完整坐标和
+validity，输入 SEW/LMUL 为结果的两倍；旧 shift 的 exact leaf 也须匹配该 operand form。
+向量 shift amount 以显式 narrow 保留指令所读的低 `log2(input SEW)` 位，标量 amount
+保持原输入元素类型。单个已物化 scalar 输入由既有 extract/splat 表达，amount 只允许
+补入完整 singleton physical axes；不隐式改变其它 broadcast 或 register mapping。
+融合留在原 shift 位置，不移动读取。相同 result type 的 scalar-splat/narrow-shift 对，
+在输入与窄结果的 register groups 相等时，可将后一个纯 splat 提至其 numeric producer 后：
+窗口最多 32 个操作，须跨同型 narrow-shift，且不能跨 region 或任何 effect。实际载体寿命
+仍由后续资源主链核算。`weft-narrow-shift` 输出融合数和重排的 splat 数；emitter 不识别
+producer 模式。每次融合消除一个已有 shift，不复制 shift producer，工作表有输入 DAG 上界。
 
 ### `SelectRISCVScalarLoadPrimes`
 

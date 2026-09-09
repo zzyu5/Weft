@@ -1698,6 +1698,45 @@ mlir::LogicalResult Emitter::compileRVVWidenAdd(riscv::RVVWidenAddOp operation) 
   return mlir::success();
 }
 
+mlir::LogicalResult Emitter::compileRVVNarrowShiftRight(
+    riscv::RVVNarrowShiftRightOp operation) {
+  auto input = materializeNumeric(operation.getInput(),
+                                  bindings.lookup(operation.getInput()));
+  auto amount = materializeNumeric(operation.getAmount(),
+                                   bindings.lookup(operation.getAmount()));
+  const llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool vectorAmount = instruction == "rvv.vnsrl.wv";
+  if (mlir::failed(input) || mlir::failed(amount) ||
+      input->kind != Binding::Kind::Vector ||
+      (instruction != "rvv.vnsrl.wv" && instruction != "rvv.vnsrl.wx") ||
+      amount->kind != (vectorAmount ? Binding::Kind::Vector : Binding::Kind::Scalar))
+    return fail(operation, "RVV narrowing shift operands disagree with selected instruction");
+  const std::string intrinsic =
+      std::string(vectorAmount ? "__riscv_vnsrl_wv_" : "__riscv_vnsrl_wx_") +
+      vectorSuffix(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto source = mappedPart(operation.getOperation(), 0, part);
+    if (!source || *source >= input->parts.size())
+      return fail(operation, "RVV narrowing shift has no closed input-part mapping");
+    std::string shift = amount->scalar;
+    if (vectorAmount) {
+      auto index = mappedPart(operation.getOperation(), 1, part);
+      if (!index || *index >= amount->parts.size())
+        return fail(operation, "RVV narrowing shift has no closed amount-part mapping");
+      shift = amount->parts[*index];
+    }
+    std::string name = fresh("narrow_shift");
+    line(vectorType(operation.getResult()) + " " + name + " = " + intrinsic +
+         "(" + input->parts[*source] + ", " + shift + ", " +
+         partVL(operation.getResult(), part) + ");");
+    result.parts.push_back(std::move(name));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
 mlir::LogicalResult Emitter::compileRVVWidenMultiply(
     riscv::RVVWidenMultiplyOp operation) {
   auto lhs = materializeNumeric(operation.getLhs(),

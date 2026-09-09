@@ -339,6 +339,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVWidenMultiply(multiply);
   if (auto add = mlir::dyn_cast<riscv::RVVWidenAddOp>(operation))
     return compileRVVWidenAdd(add);
+  if (auto shift = mlir::dyn_cast<riscv::RVVNarrowShiftRightOp>(operation))
+    return compileRVVNarrowShiftRight(shift);
   if (auto multiply =
           mlir::dyn_cast<riscv::RVVWidenScalarMultiplyOp>(operation))
     return compileRVVWidenScalarMultiply(multiply);

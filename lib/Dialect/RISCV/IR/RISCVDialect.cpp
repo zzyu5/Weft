@@ -6605,6 +6605,31 @@ mlir::LogicalResult RVVWidenAddOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult RVVNarrowShiftRightOp::verify() {
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  auto input = getInput().getType();
+  auto result = getResult().getType();
+  auto element = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  const bool vectorAmount = getAmount().getType() == result;
+  const llvm::StringRef instruction =
+      vectorAmount ? "rvv.vnsrl.wv" : "rvv.vnsrl.wx";
+  const llvm::StringRef tail =
+      result.getLayout().getValidity() == "tail" ? "agnostic" : "exact";
+  const int64_t operandGroups = input.getLayout().getRegisterGroups() +
+      (vectorAmount ? result.getLayout().getRegisterGroups() : 0);
+  if (!kernel || !element || !element.isUnsigned() ||
+      !supportsRVVWidenAdd(kernel.getTarget(), result, result, input) ||
+      (!vectorAmount && getAmount().getType() != input.getElementType()) ||
+      !exactLeaf(getLeaf(), "rvv", "narrow-shift-right", instruction, "none", tail) ||
+      getLeaf().getOperandGroups() != operandGroups ||
+      getLeaf().getResultGroups() != result.getLayout().getRegisterGroups() ||
+      getLeaf().getTemporaryGroups() != 0 || getLeaf().getFragmentGroups() != 0 ||
+      getLeaf().getLocalBytes() != 0)
+    return emitOpError(
+        "RVV narrowing logical shift requires coordinate-identical unsigned vectors with doubled input width/LMUL, a result-width vector or input-width scalar shift amount, and exact leaf resources");
+  return mlir::success();
+}
+
 mlir::LogicalResult RVVWidenMultiplyOp::verify() {
   ValueType lhs = getLhs().getType();
   ValueType rhs = getRhs().getType();

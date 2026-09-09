@@ -1492,6 +1492,15 @@ def WeftRISCV_RVVWidenAddOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVNarrowShiftRightOp
+    : WeftRISCV_LeafOp<"rvv_narrow_shift_right", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       AnyType:$amount,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVWidenMultiplyOp
     : WeftRISCV_LeafOp<"rvv_widen_multiply", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,

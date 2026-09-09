@@ -2596,9 +2596,11 @@ mlir::LogicalResult selectByteProjections(mlir::ModuleOp module,
         indexType.getLayout().getValidity() != "full")
       continue;
     bool ordered = true;
+    unsigned remaining = 256;
     for (mlir::Operation *cursor = read->getNextNode(); cursor != root;
          cursor = cursor->getNextNode()) {
-      if (!cursor || !mlir::isMemoryEffectFree(cursor)) {
+      if (!cursor || !remaining-- || cursor->getNumRegions() ||
+          !canMoveReadBefore(cursor)) {
         ordered = false;
         break;
       }

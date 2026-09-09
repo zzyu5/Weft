@@ -698,6 +698,8 @@ private:
   mlir::LogicalResult
   compileRVVWidenMultiply(riscv::RVVWidenMultiplyOp operation);
   mlir::LogicalResult compileRVVWidenAdd(riscv::RVVWidenAddOp operation);
+  mlir::LogicalResult compileRVVNarrowShiftRight(
+      riscv::RVVNarrowShiftRightOp operation);
   mlir::LogicalResult compileRVVWidenScalarMultiply(
       riscv::RVVWidenScalarMultiplyOp operation);
   mlir::LogicalResult compileRVVMultiplyHighScalar(

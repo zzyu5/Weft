@@ -56,8 +56,8 @@ def compute(
         main = wl.reduce(wl.reduce(dot * scale, axis="scale_part"), axis="group")
         delta_shift = wl.u16(3) + entry * wl.u16(4)
         delta_bit = wl.narrow(
-            qh >> delta_shift & wl.u16(1), wl.u8, rounding="rtz", saturation=False
-        )
+            qh >> delta_shift, wl.u8, rounding="rtz", saturation=False
+        ) & wl.u8(1)
         delta = wl.i8(1) - wl.i8(delta_bit) * wl.i8(2)
         payload_u8 = wl.narrow(payload, wl.u8, rounding="rtz", saturation=False)
         delta = delta + wl.i8(payload_u8) * wl.i8(0)

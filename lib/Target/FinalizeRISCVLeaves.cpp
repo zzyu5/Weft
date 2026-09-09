@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 
 using namespace weft;
 
@@ -168,6 +169,178 @@ void selectUnsignedMultiplyHigh(mlir::ModuleOp module) {
     rewriter.eraseOp(shift);
     rewriter.eraseOp(multiply);
   }
+}
+
+bool addsOnlySingletonAxes(riscv::ValueType source, riscv::ValueType result) {
+  if (!source || !result || source.getElementType() != result.getElementType() ||
+      source.getAxisIds().size() >= result.getAxisIds().size())
+    return false;
+  auto from = source.getLayout(), to = result.getLayout();
+  if (from.getCarrier() != "rvv" || to.getCarrier() != "rvv" ||
+      from.getSew() != to.getSew() || from.getLmulEighths() != to.getLmulEighths() ||
+      from.getVl() != to.getVl() || from.getValidity() != to.getValidity() ||
+      from.getRegisterGroups() != to.getRegisterGroups())
+    return false;
+  size_t next = 0;
+  for (size_t position = 0; position < result.getAxisIds().size(); ++position) {
+    const bool shared = next < source.getAxisIds().size() &&
+        source.getAxisIds()[next] == result.getAxisIds()[position];
+    for (auto [left, right] : {
+             std::pair(source.getShape(), result.getShape()),
+             std::pair(from.getTimeFactors(), to.getTimeFactors()),
+             std::pair(from.getLaneFactors(), to.getLaneFactors()),
+             std::pair(from.getReplicaFactors(), to.getReplicaFactors()),
+             std::pair(from.getFragmentFactors(), to.getFragmentFactors()),
+             std::pair(from.getLocalFactors(), to.getLocalFactors())})
+      if (right[position] != (shared ? left[next] : 1))
+        return false;
+    next += shared;
+  }
+  return next == source.getAxisIds().size();
+}
+
+bool isSingletonScalar(mlir::Type type, mlir::Type element) {
+  if (type == element)
+    return true;
+  auto value = mlir::dyn_cast<riscv::ValueType>(type);
+  if (!value || value.getElementType() != element ||
+      value.getLayout().getCarrier() != "scalar" ||
+      value.getLayout().getValidity() != "full")
+    return false;
+  for (auto factors : {value.getShape(), value.getLayout().getTimeFactors(),
+                       value.getLayout().getLaneFactors(),
+                       value.getLayout().getReplicaFactors(),
+                       value.getLayout().getFragmentFactors(),
+                       value.getLayout().getLocalFactors()})
+    if (llvm::any_of(factors.asArrayRef(), [](int64_t factor) { return factor != 1; }))
+      return false;
+  return true;
+}
+
+void selectUnsignedNarrowShifts(mlir::ModuleOp module) {
+  mlir::IRRewriter rewriter(module.getContext());
+  llvm::SmallVector<riscv::NarrowOp> candidates;
+  module.walk([&](riscv::NarrowOp op) { candidates.push_back(op); });
+  unsigned selected = 0, clusteredSplats = 0;
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    auto narrow = candidates[index];
+    auto kernel = narrow->getParentOfType<riscv::KernelOp>();
+    auto result = mlir::dyn_cast<riscv::ValueType>(narrow.getResult().getType());
+    auto element = result
+        ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+        : mlir::IntegerType();
+    auto shift = narrow.getInput().getDefiningOp<riscv::BinaryOp>();
+    if (!kernel || kernel.getResourcesMaterialized() || narrow.getSaturate() ||
+        narrow.getRounding() != "rtz" || !element || !element.isUnsigned() ||
+        !shift || shift.getKind() != "shr" ||
+        shift->getBlock() != narrow->getBlock() || !shift.getResult().hasOneUse())
+      continue;
+    auto input = mlir::dyn_cast<riscv::ValueType>(shift.getResult().getType());
+    if (!riscv::supportsRVVWidenAdd(kernel.getTarget(), result, result, input))
+      continue;
+    const bool splatInput = isSingletonScalar(shift.getLhs().getType(),
+                                             input.getElementType());
+    if (!splatInput && shift.getLhs().getType() != input)
+      continue;
+    auto amountType = mlir::dyn_cast<riscv::ValueType>(shift.getRhs().getType());
+    const bool broadcastAmount = addsOnlySingletonAxes(amountType, input);
+    auto lanes = riscv_internal::staticProduct(input.getLayout().getLaneFactors().asArrayRef());
+    if (broadcastAmount && (!lanes || *lanes <= 0))
+      continue;
+    const bool vectorAmount = shift.getRhs().getType() == input || broadcastAmount;
+    if (!vectorAmount && shift.getRhs().getType() != input.getElementType())
+      continue;
+    if (shift.getLeaf().getInstruction() !=
+        (splatInput ? "rvv.vsrl.vv.splat-lhs" :
+         vectorAmount ? "rvv.vsrl.vv" : "rvv.vsrl.vx"))
+      continue;
+    if (splatInput && (!vectorAmount || riscv::fieldReadProjection(shift.getLhs())))
+      continue;
+    // Retain the original shift's read point. The explicit RHS projection
+    // preserves all low log2(input SEW) bits consumed by vnsrl.
+    rewriter.setInsertionPoint(shift);
+    mlir::Value source = shift.getLhs();
+    if (splatInput) {
+      mlir::OpBuilder::InsertionGuard insertion(rewriter);
+      auto *producer = source.getDefiningOp();
+      if (producer && producer->getBlock() == shift->getBlock() &&
+          input.getLayout().getRegisterGroups() == result.getLayout().getRegisterGroups()) {
+        unsigned remaining = 32;
+        bool ordered = true, crossedPeer = false;
+        for (auto *cursor = producer->getNextNode(); cursor != shift;
+             cursor = cursor->getNextNode()) {
+          if (!cursor || !remaining-- || cursor->getNumRegions() ||
+              !mlir::isMemoryEffectFree(cursor)) {
+            ordered = false;
+            break;
+          }
+          if (auto peer = mlir::dyn_cast<riscv::RVVNarrowShiftRightOp>(cursor))
+            crossedPeer |= peer.getResult().getType() == result;
+        }
+        if (ordered && crossedPeer) {
+          rewriter.setInsertionPointAfter(producer);
+          ++clusteredSplats;
+        }
+      }
+      if (auto scalar = mlir::dyn_cast<riscv::ValueType>(source.getType())) {
+        auto zero = rewriter.create<mlir::arith::ConstantIndexOp>(shift.getLoc(), 0);
+        llvm::SmallVector<mlir::Value> indices(scalar.getShape().size(), zero);
+        llvm::SmallVector<mlir::Attribute> selectors(scalar.getShape().size(),
+                                                    rewriter.getStringAttr("index"));
+        source = rewriter.create<riscv::ExtractOp>(
+            shift.getLoc(), input.getElementType(), source, indices,
+            rewriter.getArrayAttr(selectors),
+            riscv::AccessAttr::get(rewriter.getContext(), "unit", "dense", 1,
+                                   0, 0, 0, 0, 0, 0, 0, 0, 0, "none"),
+            riscv_internal::leaf(rewriter, "transfer", "extract",
+                                 "rvv.extract.unit", "rvv.extract.unit", 0, 0));
+      }
+      source = rewriter.create<riscv::RVVSplatOp>(
+          shift.getLoc(), input, source,
+          riscv_internal::leaf(rewriter, "rvv", "splat", "rvv.splat", "rvv.splat",
+                               0, input.getLayout().getRegisterGroups()));
+    }
+    mlir::Value amount = shift.getRhs();
+    if (broadcastAmount) {
+      amount = rewriter.create<riscv::RVVAxisBroadcastOp>(
+          shift.getLoc(), input, amount,
+          riscv_internal::leaf(
+              rewriter, "rvv", "axis-broadcast", "rvv.axis-broadcast",
+              "rvv.axis-broadcast", amountType.getLayout().getRegisterGroups(),
+              input.getLayout().getRegisterGroups(), 0, 0, "none", "exact", {*lanes, *lanes}));
+    }
+    if (vectorAmount) {
+      auto widen = amount.getDefiningOp<riscv::WidenOp>();
+      if (widen && widen.getInput().getType() == result) {
+        amount = widen.getInput();
+      } else {
+        auto projection = mlir::cast<riscv::NarrowOp>(rewriter.clone(*narrow));
+        projection.getInputMutable().assign(amount);
+        amount = projection.getResult();
+        // Each successful selection removes one existing shift; no shift
+        // producers are cloned, so this worklist is bounded by the input DAG.
+        if (projection.getInput().getDefiningOp<riscv::BinaryOp>())
+          candidates.push_back(projection);
+      }
+    }
+    const llvm::StringRef instruction =
+        vectorAmount ? "rvv.vnsrl.wv" : "rvv.vnsrl.wx";
+    auto replacement = rewriter.create<riscv::RVVNarrowShiftRightOp>(
+        shift.getLoc(), result, source, amount,
+        riscv_internal::leaf(
+            rewriter, "rvv", "narrow-shift-right", instruction, instruction,
+            input.getLayout().getRegisterGroups() +
+                (vectorAmount ? result.getLayout().getRegisterGroups() : 0),
+            result.getLayout().getRegisterGroups(), 0, 0, "none",
+            result.getLayout().getValidity() == "tail" ? "agnostic" : "exact"));
+    riscv_internal::copyOrigin(narrow, replacement);
+    rewriter.replaceOp(narrow, replacement.getResult());
+    rewriter.eraseOp(shift);
+    ++selected;
+  }
+  if (selected)
+    llvm::errs() << "weft-narrow-shift: selected=" << selected
+                 << " clustered-splats=" << clusteredSplats << '\n';
 }
 
 mlir::LogicalResult materializeFieldReads(mlir::ModuleOp module) {
@@ -365,8 +538,11 @@ public:
                       implementation.getParameters().asArrayRef()));
       operation->removeAttr("implementation");
     });
-    if (failed)
+    if (failed) {
       signalPassFailure();
+      return;
+    }
+    selectUnsignedNarrowShifts(getOperation());
   }
 };
 

@@ -26,12 +26,14 @@ def compute(
         word1 = wl.widen(w.q[group_word + wl.u32(2)], wl.u32) | wl.widen(
             w.q[group_word + wl.u32(3)], wl.u32
         ) << wl.u32(16)
-        sign_index = word1 >> entry * wl.u32(7) & wl.u32(127)
+        sign_index = wl.narrow(
+            word1 >> entry * wl.u32(7), wl.u16, rounding="rtz", saturation=False
+        ) & wl.u16(127)
         weight = wl.lookup(
             grid_values, grid_index * wl.u32(8) + payload, bounds="in_bounds"
         )
         sign = wl.lookup(
-            sign_values, sign_index * wl.u32(8) + payload, bounds="in_bounds"
+            sign_values, sign_index * wl.u16(8) + payload, bounds="in_bounds"
         )
         activation = x.q[group * wl.u32(32) + entry * wl.u32(8) + wl.u32(payload)]
         partial = wl.reduce_dot(activation, weight * sign, over=("entry", "payload"), acc_dtype=wl.i32)
