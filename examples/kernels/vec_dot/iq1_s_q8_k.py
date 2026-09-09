@@ -32,10 +32,7 @@ def compute(
             group * wl.u16(32) + entry * wl.u16(8) + payload
         ]
         group_sum = wl.reduce_dot(activation, weight, over=("entry", "payload"), acc_dtype=wl.i32)
-        delta = (
-            wl.i32(1)
-            - wl.i32(metadata >> wl.u16(15) & wl.u16(1)) * wl.i32(2)
-        )
+        delta = wl.i32((wl.i16(metadata) >> wl.i16(15)) | wl.i16(1))
         main = wl.reduce(scale * group_sum, axis="group")
         correction = wl.reduce(
             scale
